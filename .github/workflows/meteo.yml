@@ -1,0 +1,31 @@
+name: Woluwe Morning Weather Bot
+
+on:
+  schedule:
+    # 06:00 UTC = 08:00 heure belge (été) / 07:00 UTC = 08:00 heure belge (hiver)
+    # On lance à 06:00 UTC pour que tu l'aies pile à 8h00 !
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Permet de le tester immédiatement avec 1 clic
+
+jobs:
+  send-weather:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install libraries
+        run: |
+          pip install playwright playwright-stealth requests
+          playwright install --with-deps chromium
+
+      - name: Run Weather Script
+        env:
+          # ICI : On lie ce script UNIQUEMENT au deuxième secret Discord !
+          DISCORD_WEBHOOK_METEO: ${{ secrets.DISCORD_WEBHOOK_METEO }}
+        run: python meteo_bot.py
