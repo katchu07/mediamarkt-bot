@@ -1,5 +1,4 @@
 import asyncio
-import random
 import os
 import re
 from datetime import datetime
@@ -8,11 +7,17 @@ from urllib.parse import urljoin
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
+# ==========================================
+# PAS HIER JE KORTINGSPERCENTAGE AAN:
+# ==========================================
+MIN_DISCOUNT = 15.0  # Nu op 15% om Discord te testen! Zet straks op 50.0 of 60.0
+
+# Maximaal aantal meldingen per scan-ronde (voorkomt Discord-spam tijdens het testen!)
+MAX_ALERTS_PER_RUN = 3
+
 BASE_URL = "https://outlet.mediamarkt.be/"
-# Veilig ophalen via de GitHub Secrets kluis die we zonet hebben ingesteld
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
 MEMORY_FILE = "gevonden_deals.txt"
-MIN_DISCOUNT = 60.0  # Melding vanaf 60% korting (en extra alarm bij 70%+)
 
 SELECTORS = {
     "category_links": "a[href*='route=product/category']",
@@ -21,8 +26,7 @@ SELECTORS = {
     "link": "h4 a, .name a, .image a, a[href*='route=product/product'], a[href]",
     "old_price": ".price-old, .old-price, del, s, .strike-price",
     "new_price": ".price-new, .new-price, .special-price, .current-price, .price",
-    "discount_badge": ".sale, .discount, .badge-discount, .percentage, .save-badge, .label-danger",
-    "next_page": "ul.pagination li a:has-text('>'):not(:has-text('>|')), a.next, a[rel='next']"
+    "discount_badge": ".sale, .discount, .badge-discount, .percentage, .save-badge, .label-danger"
 }
 
 def load_seen_deals() -> set:
@@ -66,23 +70,24 @@ def parse_percentage(badge_str: str) -> float:
 
 def send_discord_notification(title: str, old_price: float, new_price: float, discount: float, url: str):
     if not DISCORD_WEBHOOK_URL:
+        print("[FOUT] Geen DISCORD_WEBHOOK gevonden in GitHub Secrets!")
         return
 
     old_price_str = f"€ {old_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if old_price > 0 else "Onbekend"
     new_price_str = f"€ {new_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if new_price > 0 else "Zie website"
 
-    if discount >= 70.0:
-        header_title = f"🚨 EXTREME DEAL: -{discount:.1f}% KORTING! 🚨"
-        ping_text = "@everyone 🔥 **70%+ KORTING GEVONDEN!**"
+    if discount >= 50.0:
+        header_title = f"🚨 KORTINGSLIMIET VERHOOGD: -{discount:.1f}% DEAL! 🚨"
+        ping_text = f"@everyone 🔥 **MediaMarkt Outlet zit nu op -{discount:.1f}% korting!**"
         embed_color = 16711680
     else:
-        header_title = f"🔥 DIKKE DEAL: -{discount:.1f}% Korting!"
-        ping_text = f"⚡ **Nieuwe deal gevonden (-{discount:.1f}%)!**"
+        header_title = f"✅ TEST / DEAL: -{discount:.1f}% Korting!"
+        ping_text = f"⚡ **Deal gevonden met -{discount:.1f}% korting (Filter staat op >={MIN_DISCOUNT:.0f}%)**"
         embed_color = 16753920
 
     embed = {
         "title": header_title,
-        "description": f"**[{title}]({url})**\n\n👉 **[Klik hier om direct op je telefoon te bestellen]({url})**",
+        "description": f"**[{title}]({url})**\n\n👉 **[Klik hier om de Outlet te openen]({url})**",
         "url": url,
         "color": embed_color,
         "fields": [
@@ -90,18 +95,23 @@ def send_discord_notification(title: str, old_price: float, new_price: float, di
             {"name": "💶 Nieuwe Prijs", "value": f"**{new_price_str}**", "inline": True},
             {"name": "📉 Korting", "value": f"**-{discount:.1f}%**", "inline": True}
         ],
-        "footer": {"text": f"MediaMarkt 24/7 Cloud Monitor • {datetime.now().strftime('%H:%M')}"}
+        "footer": {"text": f"Snelle MediaMarkt Monitor • {datetime.now().strftime('%H:%M:%S')}"}
     }
 
     payload = {"username": "MediaMarkt Outlet Bot", "content": ping_text, "embeds": [embed]}
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-    except Exception:
-        pass
+        res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        print(f"[DISCORD] Melding verstuurd voor {title} (-{discount:.1f}%) -> Status: {res.status_code}")
+    except Exception as e:
+        print(f"[DISCORD FOUT] {e}")
 
-async def extract_products_from_page(page, seen_deals: set):
+async def extract_products_from_page(page, seen_deals: set, alerts_sent: int) -> int:
     cards = await page.locator(SELECTORS["product_card"]).all()
+    print(f"-> {len(cards)} producten zichtbaar op deze pagina.")
+
     for card in cards:
+        if alerts_sent >= MAX_ALERTS_PER_RUN:
+            break
         try:
             link_el = card.locator(SELECTORS["link"]).first
             if await link_el.count() == 0:
@@ -114,7 +124,7 @@ async def extract_products_from_page(page, seen_deals: set):
                 continue
 
             title_el = card.locator(SELECTORS["title"]).first
-            title = (await title_el.inner_text()).strip() if await title_el.count() > 0 else "MediaMarkt Outlet Product"
+            title = (await title_el.inner_text()).strip() if await title_el.count() > 0 else "MediaMarkt Product"
             title = re.sub(r"\s+", " ", title)
 
             old_price, new_price, discount_pct = 0.0, 0.0, 0.0
@@ -139,11 +149,16 @@ async def extract_products_from_page(page, seen_deals: set):
                 send_discord_notification(title, old_price, new_price, discount_pct, product_url)
                 save_seen_deal(product_url)
                 seen_deals.add(product_url)
+                alerts_sent += 1
         except Exception:
             continue
 
+    return alerts_sent
+
 async def main():
     seen_deals = load_seen_deals()
+    alerts_sent = 0
+
     async with Stealth().use_async(async_playwright()) as p:
         browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
         context = await browser.new_context(
@@ -151,36 +166,36 @@ async def main():
             locale="nl-BE", timezone_id="Europe/Brussels"
         )
         page = await context.new_page()
-        await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(2)
 
-        await extract_products_from_page(page, seen_deals)
+        print("1. Voorpagina scannen...")
+        await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
+        await asyncio.sleep(1.5)
+        alerts_sent = await extract_products_from_page(page, seen_deals, alerts_sent)
 
-        links = await page.locator(SELECTORS["category_links"]).all()
-        categories = set()
-        for link in links:
-            href = await link.get_attribute("href")
-            if href and urljoin(BASE_URL, href).startswith(BASE_URL):
-                categories.add(urljoin(BASE_URL, href))
+        # Als we nog geen 3 deals op de voorpagina hebben gevonden, checken we maximaal 4 hoofdcategorieën (alleen pagina 1!)
+        if alerts_sent < MAX_ALERTS_PER_RUN:
+            links = await page.locator(SELECTORS["category_links"]).all()
+            categories = []
+            for link in links:
+                href = await link.get_attribute("href")
+                if href:
+                    full_url = urljoin(BASE_URL, href)
+                    if full_url.startswith(BASE_URL) and full_url not in categories:
+                        categories.append(full_url)
 
-        visited = set()
-        for cat_url in sorted(list(categories)):
-            curr = cat_url
-            while curr and curr not in visited:
-                visited.add(curr)
-                try:
-                    await page.goto(curr, wait_until="domcontentloaded", timeout=60000)
-                    await asyncio.sleep(random.uniform(1.0, 2.0))
-                    await extract_products_from_page(page, seen_deals)
-                    next_btn = page.locator(SELECTORS["next_page"]).first
-                    if await next_btn.count() > 0 and await next_btn.is_visible():
-                        next_href = await next_btn.get_attribute("href")
-                        curr = urljoin(curr, next_href) if next_href else None
-                    else:
-                        break
-                except Exception:
+            for cat_url in categories[:4]:
+                if alerts_sent >= MAX_ALERTS_PER_RUN:
                     break
+                print(f"2. Snelle check van categorie: {cat_url}")
+                try:
+                    await page.goto(cat_url, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(1.0)
+                    alerts_sent = await extract_products_from_page(page, seen_deals, alerts_sent)
+                except Exception:
+                    continue
+
         await browser.close()
+        print(f"Klaar! Totaal {alerts_sent} melding(en) naar Discord gestuurd.")
 
 if __name__ == "__main__":
     asyncio.run(main())
