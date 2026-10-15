@@ -10,10 +10,13 @@ from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
 # ==========================================
-# SETTINGS
+# SETTINGS (PAS HIER JE TEST-TIJD EN % AAN)
 # ==========================================
-MIN_DISCOUNT = 50.0  # Automatically detects any discount of 50% or higher (50%, 55%, 60%, 70%+)
+MIN_DISCOUNT = 50.0   # Melding bij 50% korting of hoger (50%, 55%, 60%, 70%+)
 MAX_ALERTS_PER_RUN = 5
+
+REPORT_HOUR = 18      # <--- TEST-UUR: Staat nu op 18 (zet na het testen op 22)
+REPORT_MINUTE = 10    # <--- TEST-MINUUT: Staat nu op 10 voor 18u10 (zet na het testen op 0)
 
 BASE_URL = "https://outlet.mediamarkt.be/"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
@@ -106,142 +109,14 @@ def send_discord_deal(title: str, old_price: float, new_price: float, discount: 
     }
     requests.post(DISCORD_WEBHOOK_URL, json={"username": "MediaMarkt Outlet Bot", "content": ping, "embeds": [embed]}, timeout=10)
 
-def send_daily_22h_report(max_seen_discount: float, max_seen_title: str, date_str: str):
-    """Sends a daily status check at 22:00 confirming the bot is working and showing the highest discount found."""
+def send_daily_report(total_found_today: int, max_seen_discount: float, max_seen_title: str, date_str: str, time_str: str):
+    """Stuurt ALTIJD het dagelijkse overzicht op het ingestelde tijdstip (ook als er wel deals waren!)."""
     if not DISCORD_WEBHOOK_URL:
         return
 
-    embed = {
-        "title": f"🌙 Daily Status Check (22:00) — {date_str}",
-        "description": (
-            f"The bot is **100% active** and running smoothly in the background (sorted *Oldest to Newest*).\n\n"
-            f"❌ **No deals of >={MIN_DISCOUNT:.0f}% found today.**\n"
-            f"📊 **Highest discount currently on the Outlet:** `-{max_seen_discount:.0f}%` *(e.g. {max_seen_title[:50]}...)*\n\n"
-            f"As soon as MediaMarkt raises the discount limit to **{MIN_DISCOUNT:.0f}%+**, you will receive an instant `@everyone` alert!"
-        ),
-        "color": 3447003,
-        "footer": {"text": "MediaMarkt 24/7 Cloud Monitor • All systems operational"}
-    }
-    requests.post(DISCORD_WEBHOOK_URL, json={"username": "MediaMarkt Outlet Bot", "embeds": [embed]}, timeout=10)
-    print("   [DISCORD] ✅ 22:00 Daily report sent!")
-
-async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent: int, highest_tracker: dict, now_str: str) -> int:
-    try:
-        await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
-        await page.wait_for_timeout(2500)
-        await page.evaluate("window.scrollBy(0, 700)")
-        await page.wait_for_timeout(1500)
-    except Exception as e:
-        print(f"   [!] Could not open {target_url}: {e}")
-        return alerts_sent
-
-    cards = await page.locator("div.product-layout, div.product-thumb, div.product, div:has(> div > a:has-text('Meer info')), div:has(> a:has-text('Meer info'))").all()
-    print(f"   -> {len(cards)} products checked (Oldest to Newest) on {target_url.split('&path=')[-1]}")
-
-    for card in cards:
-        if alerts_sent >= MAX_ALERTS_PER_RUN:
-            break
-        try:
-            text = await card.inner_text()
-            if not text or len(text.strip()) < 10:
-                continue
-
-            link_el = card.locator("a[href*='product'], a:has-text('Meer info'), a:has-text('Winkelwagen'), a[href]").first
-            if await link_el.count() == 0:
-                continue
-            href = await link_el.get_attribute("href")
-            product_url = urljoin(BASE_URL, href) if href else BASE_URL
-
-            title_match = re.split(r'\n', text.strip())
-            title = title_match[0] if title_match else "MediaMarkt Product"
-            if "Als nieuw" in title or "Korting" in title or "€" in title or "-" in title[:3]:
-                title = title_match[1] if len(title_match) > 1 else title
-            title = re.sub(r"\s+", " ", title)[:120]
-
-            old_price, new_price, discount_pct = analyze_card_text(text)
-
-            if discount_pct > highest_tracker["pct"]:
-                highest_tracker["pct"] = discount_pct
-                highest_tracker["title"] = title
-
-            if product_url in seen_deals:
-                continue
-
-            if discount_pct >= MIN_DISCOUNT:
-                print(f"   🔥 MATCH FOUND: {title} | -{discount_pct:.1f}%")
-                send_discord_deal(title, old_price, new_price, discount_pct, product_url, now_str)
-                save_seen_deal(product_url)
-                seen_deals.add(product_url)
-                alerts_sent += 1
-        except Exception:
-            continue
-
-    return alerts_sent
-
-async def main():
-    now_be = datetime.now(ZoneInfo("Europe/Brussels"))
-    now_str = now_be.strftime("%H:%M:%S")
-    today_str = now_be.strftime("%Y-%m-%d")
-
-    print(f"=== START SMART SCAN ({today_str} {now_str}) | Filter: >= {MIN_DISCOUNT}% ===")
-    seen_deals = load_seen_deals()
-    alerts_sent = 0
-    highest_tracker = {"pct": 0.0, "title": "Unknown"}
-
-    async with Stealth().use_async(async_playwright()) as p:
-        browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            locale="nl-BE", timezone_id="Europe/Brussels"
-        )
-        page = await context.new_page()
-
-        await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
-        links = await page.locator("a[href*='route=product/category'], nav a[href], .menu a[href]").all()
-        
-        main_categories = []
-        for link in links:
-            href = await link.get_attribute("href")
-            if href and "route=product/category&path=" in href:
-                full_url = urljoin(BASE_URL, href)
-                if "_" not in full_url.split("path=")[-1] and full_url not in main_categories:
-                    main_categories.append(full_url)
-
-        if len(main_categories) < 4:
-            main_categories.extend([
-                f"{BASE_URL}index.php?route=product/category&path=7060",
-                f"{BASE_URL}index.php?route=product/category&path=6966",
-                f"{BASE_URL}index.php?route=product/category&path=6991",
-                f"{BASE_URL}index.php?route=product/category&path=7095"
-            ])
-
-        random.shuffle(main_categories)
-        selected_cats = list(dict.fromkeys(main_categories))[:4]
-
-        for cat_url in selected_cats:
-            if alerts_sent >= MAX_ALERTS_PER_RUN:
-                break
-            # &limit=50 displays 50 products per page instead of 15!
-            sorted_url = f"{cat_url}&sort=p.date_added&order=ASC&limit=50"
-            alerts_sent = await scan_page_products(page, sorted_url, seen_deals, alerts_sent, highest_tracker, now_str)
-
-        await browser.close()
-
-    if alerts_sent > 0:
-        deal_flag = f"DEAL_FOUND_{today_str}"
-        if deal_flag not in seen_deals:
-            save_seen_deal(deal_flag)
-            seen_deals.add(deal_flag)
-
-    report_flag = f"DAILY_REPORT_{today_str}"
-    deal_flag = f"DEAL_FOUND_{today_str}"
-
-    if now_be.hour == 22 and report_flag not in seen_deals:
-        if deal_flag not in seen_deals and alerts_sent == 0:
-            send_daily_22h_report(highest_tracker["pct"], highest_tracker["title"], today_str)
-        save_seen_deal(report_flag)
-
-    print(f"=== DONE! Highest discount seen this run: -{highest_tracker['pct']:.1f}% | Alerts sent: {alerts_sent} ===")
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    if total_found_today > 0:
+        status_line = f"✅ **Deals found today (>={MIN_DISCOUNT:.0f}%):** `{total_found_today} deal(s) found today!`"
+        embed_color = 3066993  # Groen
+    else:
+        status_line = f"❌ **Deals found today (>={MIN_DISCOUNT:.0f
+                                                  
