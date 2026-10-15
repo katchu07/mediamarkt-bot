@@ -1,1 +1,7 @@
 DAILY_REPORT_2026-10-15_18
+https://outlet.mediamarkt.be/index.php?route=product/product&path=7095&product_id=323088&sort=p.date_added&order=ASC&limit=50
+DEAL_2026-10-15_https://outlet.mediamarkt.be/index.php?route=product/product&path=7095&product_id=323088&sort=p.date_added&order=ASC&limit=50
+https://outlet.mediamarkt.be/index.php?route=product/product&path=7095&product_id=325480&sort=p.date_added&order=ASC&limit=50
+DEAL_2026-10-15_https://outlet.mediamarkt.be/index.php?route=product/product&path=7095&product_id=325480&sort=p.date_added&order=ASC&limit=50
+https://outlet.mediamarkt.be/index.php?route=product/product&path=7095&product_id=338383&sort=p.date_added&order=ASC&limit=50
+DEAL_2026-10-15_https://outlet.mediamarkt.be/index.php?route=product/product&path=7095&product_id=338383&sort=p.date_added&order=ASC&limit=50
