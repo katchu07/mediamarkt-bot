@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import random
 from datetime import datetime
 import requests
 from urllib.parse import urljoin
@@ -8,10 +9,11 @@ from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
 # ==========================================
-# TEST MODUS:
+# INSTELLINGEN
 # ==========================================
-MIN_DISCOUNT = 15.0  
-MAX_ALERTS_PER_RUN = 3
+MIN_DISCOUNT = 50.0  # Pakt alles vanaf 50% en hoger!
+MAX_ALERTS_PER_RUN = 5
+
 BASE_URL = "https://outlet.mediamarkt.be/"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
 MEMORY_FILE = "gevonden_deals.txt"
@@ -47,14 +49,12 @@ def analyze_card_text(text: str):
     old_price = 0.0
     new_price = 0.0
     
-    # Zoek naar kortingspercentages
     pct_matches = re.findall(r"-\s*(\d+(?:[.,]\d+)?)\s*%|(\d+(?:[.,]\d+)?)\s*%", text)
     for m in pct_matches:
         val = parse_eu_number(m[0] or m[1])
         if 5.0 <= val <= 95.0:
             discount_pct = max(discount_pct, val)
 
-    # Zoek naar europrijzen
     price_matches = re.findall(r"(?:€\s*)?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}|[.,]-))(?:\s*€)?|€\s*(\d+(?:[.,]\d+)?)", text)
     prices = []
     for pm in price_matches:
@@ -77,19 +77,19 @@ def analyze_card_text(text: str):
 
 def send_discord_deal(title: str, old_price: float, new_price: float, discount: float, url: str):
     if not DISCORD_WEBHOOK_URL:
-        print("❌ FOUT: Geen Discord URL gevonden in de kluis!")
         return
     
     old_str = f"€ {old_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if old_price > 0 else "Zie site"
     new_str = f"€ {new_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if new_price > 0 else "Zie site"
 
-    if discount >= 50.0:
-        header = f"🚨 EXTREME DEAL: -{discount:.1f}% KORTING!"
-        ping = f"@everyone 🔥 **MediaMarkt Outlet zit nu op -{discount:.1f}% korting!**"
+    # Nu 50%+ de standaard is, maken we de 70%+ deals extra opvallend
+    if discount >= 70.0:
+        header = f"🚨 BIZARRE DEAL: -{discount:.1f}% KORTING!"
+        ping = f"@everyone 🔥 **MediaMarkt Outlet dumpt dit voor -{discount:.1f}%!**"
         color = 16711680
     else:
         header = f"✅ DEAL GEVONDEN: -{discount:.1f}% Korting!"
-        ping = f"⚡ **Nieuwe deal gevonden (-{discount:.1f}%)!**"
+        ping = f"⚡ **Dikke deal gevonden (-{discount:.1f}%)!**"
         color = 16753920
 
     embed = {
@@ -104,23 +104,20 @@ def send_discord_deal(title: str, old_price: float, new_price: float, discount: 
         ],
         "footer": {"text": f"MediaMarkt Outlet Monitor • {datetime.now().strftime('%H:%M:%S')}"}
     }
-    requests.post(DISCORD_WEBHOOK_URL, json={"username": "MediaMarkt Outlet Bot", "content": ping, "embeds": [embed]}, timeout=10)
+    requests.post(DISCORD_WEBHOOK_URL, json={"username": "MediaMarkt Bot", "content": ping, "embeds": [embed]}, timeout=10)
 
-async def scan_page_products(page, seen_deals: set, alerts_sent: int) -> int:
-    # We wachten extra lang en scrollen naar beneden om de plaatjes in te laden
-    await page.wait_for_timeout(3500)
-    await page.evaluate("window.scrollBy(0, 700)")
-    await page.wait_for_timeout(2000)
+async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent: int) -> int:
+    try:
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(2500)
+        await page.evaluate("window.scrollBy(0, 800)")
+        await page.wait_for_timeout(1500)
+    except Exception as e:
+        print(f"   [!] Fout bij openen {target_url}: {e}")
+        return alerts_sent
 
-    # NIEUWE SELECTOR: Hij zoekt nu keihard naar de knop 'Meer info' uit jouw screenshot!
     cards = await page.locator("div.product-layout, div.product-thumb, div.product, div:has(> div > a:has-text('Meer info')), div:has(> a:has-text('Meer info'))").all()
-    print(f"   -> {len(cards)} productblokken ontdekt op deze pagina.")
-
-    if len(cards) == 0:
-        page_title = await page.title()
-        print(f"   ⚠️ WAARSCHUWING: 0 producten! De paginatitel is: '{page_title}'")
-        if "Access Denied" in page_title or "Just a moment" in page_title or "Cloudflare" in page_title:
-            print("   🚨 BOT-DETECTIE: MediaMarkt blokkeert op dit moment de GitHub Cloud-server!")
+    print(f"   -> {len(cards)} producten ontdekt op {target_url.split('&path=')[-1] if '&path=' in target_url else 'Voorpagina'}")
 
     for card in cards:
         if alerts_sent >= MAX_ALERTS_PER_RUN:
@@ -136,11 +133,10 @@ async def scan_page_products(page, seen_deals: set, alerts_sent: int) -> int:
             href = await link_el.get_attribute("href")
             product_url = urljoin(BASE_URL, href) if href else BASE_URL
 
-            # In de testmodus (<35%) negeert hij duplicaten, zodat je altijd meldingen krijgt tijdens het testen!
-            if MIN_DISCOUNT >= 35.0 and product_url in seen_deals:
+            # Bij de echte 50% scan blokkeren we duplicaten strikt!
+            if product_url in seen_deals:
                 continue
 
-            # Zoek de titel op
             title_match = re.split(r'\n', text.strip())
             title = title_match[0] if title_match else "MediaMarkt Product"
             if "Als nieuw" in title or "Korting" in title or "€" in title or "-" in title[:3]:
@@ -150,12 +146,10 @@ async def scan_page_products(page, seen_deals: set, alerts_sent: int) -> int:
             old_price, new_price, discount_pct = analyze_card_text(text)
 
             if discount_pct >= MIN_DISCOUNT:
-                print(f"   🔥 DEAL GEVONDEN: {title} | -{discount_pct:.1f}%")
+                print(f"   🔥 {discount_pct:.1f}% KORTING GEVONDEN: {title}")
                 send_discord_deal(title, old_price, new_price, discount_pct, product_url)
-                
-                if MIN_DISCOUNT >= 35.0:
-                    save_seen_deal(product_url)
-                    seen_deals.add(product_url)
+                save_seen_deal(product_url)
+                seen_deals.add(product_url)
                 alerts_sent += 1
         except Exception:
             continue
@@ -163,7 +157,7 @@ async def scan_page_products(page, seen_deals: set, alerts_sent: int) -> int:
     return alerts_sent
 
 async def main():
-    print(f"=== START SCAN (Filter: >= {MIN_DISCOUNT}%) ===")
+    print(f"=== START RANDOM DIEPTE-SCAN (Filter: >= {MIN_DISCOUNT}%) ===")
     seen_deals = load_seen_deals()
     alerts_sent = 0
 
@@ -175,18 +169,46 @@ async def main():
         )
         page = await context.new_page()
 
-        print("1. Jouw specifieke DJ categorie openen...")
-        # Directe aanval op de URL van jouw screenshot!
-        await page.goto(BASE_URL + "index.php?route=product/category&path=7060_7158", wait_until="domcontentloaded", timeout=60000)
-        alerts_sent = await scan_page_products(page, seen_deals, alerts_sent)
+        print("1. Categorieën ophalen vanaf voorpagina...")
+        await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
+        
+        links = await page.locator("a[href*='route=product/category'], nav a[href], .menu a[href]").all()
+        categories = []
+        for link in links:
+            href = await link.get_attribute("href")
+            if href:
+                full_url = urljoin(BASE_URL, href)
+                if full_url.startswith(BASE_URL) and full_url != BASE_URL and full_url not in categories:
+                    categories.append(full_url)
 
-        if alerts_sent < MAX_ALERTS_PER_RUN:
-            print("2. Voorpagina checken...")
-            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
-            alerts_sent = await scan_page_products(page, seen_deals, alerts_sent)
+        # We pakken 3 willekeurige categorieën uit de hele lijst
+        random.shuffle(categories)
+        target_cats = categories[:3]
+        
+        # We voegen ook bewust de voorpagina toe om recente flitsdeals niet te missen
+        target_cats.append(BASE_URL)
+
+        for cat_url in target_cats:
+            if alerts_sent >= MAX_ALERTS_PER_RUN:
+                break
+            
+            # Bepaal willekeurige paginanummers om diep in het assortiment te prikken (ouder voorraad)
+            # Voorblad krijgt uiteraard geen paginanummer, categorieën krijgen 2 willekeurige pagina's
+            if cat_url == BASE_URL:
+                random_pages = [1]
+            else:
+                random_pages = [random.randint(1, 3), random.randint(4, 9)]
+
+            for page_num in set(random_pages):
+                if alerts_sent >= MAX_ALERTS_PER_RUN:
+                    break
+                
+                scan_url = f"{cat_url}&page={page_num}" if "?" in cat_url and page_num > 1 else cat_url
+                print(f"\n[SCANNEN] Categorie URL: {scan_url}")
+                alerts_sent = await scan_page_products(page, scan_url, seen_deals, alerts_sent)
 
         await browser.close()
-        print(f"=== KLAAR! Totaal {alerts_sent} deal-melding(en) verstuurd. ===")
+        print(f"\n=== KLAAR! Totaal {alerts_sent} deal-melding(en) >50% verstuurd. ===")
 
 if __name__ == "__main__":
     asyncio.run(main())
