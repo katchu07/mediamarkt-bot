@@ -1,0 +1,28 @@
+name: Daily Gold Tracker Bot
+
+on:
+  schedule:
+    # Tourne tous les jours à 07:00 UTC = 09:00 heure belge
+    - cron: '0 7 * * *'
+  workflow_dispatch: # Pour le tester immédiatement en 1 clic
+
+jobs:
+  track-gold:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install libraries
+        run: |
+          pip install requests beautifulsoup4
+
+      - name: Run Gold Tracker
+        env:
+          DISCORD_WEBHOOK_GOLD: ${{ secrets.DISCORD_WEBHOOK_GOLD }}
+        run: python gold_bot.py
