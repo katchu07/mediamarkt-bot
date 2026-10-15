@@ -1,0 +1,27 @@
+name: Stock & Expert Dip Bot
+
+on:
+  schedule:
+    - cron: '0 20 * * 1-5'  # Maandag t/m vrijdag om 22:00 uur Belgische tijd
+  workflow_dispatch:        # Om handmatig te testen
+
+jobs:
+  check-stocks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install libraries
+        run: |
+          pip install requests
+
+      - name: Run Stock Analysis
+        env:
+          DISCORD_WEBHOOK_STOCKS: ${{ secrets.DISCORD_WEBHOOK_STOCKS }}
+        run: python stocks_bot.py
