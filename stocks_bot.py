@@ -4,16 +4,21 @@ from zoneinfo import ZoneInfo
 import requests
 
 # ==========================================
-# SETTINGS
+# SETTINGS (Focus sur les actions à fort potentiel / volatiles)
 # ==========================================
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_STOCKS")
-MY_DISCORD_ID = "644995150774272020"  # Ton ID utilisateur pour les pings d'urgence
+MY_DISCORD_ID = "644995150774272020"  # Ton ID Discord pour les pings d'urgence
 TZ = ZoneInfo("Europe/Brussels")
 
-WATCHLIST = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", 
-    "NFLX", "AMD", "INTL", "DIS", "PYPL", "BA", "JPM", "V",
-    "ASML.AS", "ADYEN.AS", "ABI.BR", "SOLB.BR"
+# Liste élargie : actions de croissance, tech innovante, et valeurs à fort potentiel de rebond
+EXPANDED_WATCHLIST = [
+    # Tech & Croissance / Potentiel fort
+    "PLTR", "COIN", "HOOD", "RBLX", "SOFI", "U", "SHOP", "SQ", "RIVN", "LCID",
+    "SNOW", "CRWD", "DDOG", "NET", "PATH", "ARM", "SMCI", "AMD", "NVDA",
+    # Valeurs européennes / technologiques / vertes en vue
+    "ASML.AS", "ADYEN.AS", "NIO", "BABA", "PDD", "SE", "MELI",
+    # Énergies / Biotech / Volatiles
+    "ENPH", "SEDG", "IONQ", "QUBT"
 ]
 
 def fetch_stock_data(ticker: str) -> dict:
@@ -37,13 +42,13 @@ def fetch_stock_data(ticker: str) -> dict:
                 "change_pct": change_pct,
                 "currency": meta.get("currency", "USD")
             }
-    except Exception as e:
-        print(f"   [!] Error fetching {ticker}: {e}")
+    except Exception:
+        pass
     return None
 
 def fetch_analyst_opinion(ticker: str) -> tuple:
     try:
-        url = f"https://query2.finance.yahoo.com/v11/finance/quoteSummary/{ticker}?modules=financialData,recommendationTrend"
+        url = f"https://query2.finance.yahoo.com/v11/finance/quoteSummary/{ticker}?modules=financialData"
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
@@ -61,20 +66,18 @@ def send_discord_message(payload: dict):
         print("❌ ERROR: DISCORD_WEBHOOK_STOCKS secret is missing!")
         return
     try:
-        res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        print(f"   [DISCORD] Message sent -> Status {res.status_code}")
+        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
     except Exception as e:
         print(f"   [DISCORD ERROR] {e}")
 
 def main():
     now_be = datetime.now(TZ)
     date_str = now_be.strftime("%Y-%m-%d %H:%M")
-    print(f"=== START STOCK & EXPERT CHECK ({date_str}) ===")
+    print(f"=== START GROWTH & DIP CHECK ({date_str}) ===")
 
-    significant_dips = []
     market_overview = []
 
-    for ticker in WATCHLIST:
+    for ticker in EXPANDED_WATCHLIST:
         data = fetch_stock_data(ticker)
         if not data:
             continue
@@ -84,57 +87,60 @@ def main():
         data["target_price"] = target
         
         market_overview.append(data)
-        
-        if data["change_pct"] <= -3.5:
-            significant_dips.append(data)
 
+    # Tri pour afficher en premier les plus grosses baisses de la journée (les "Losers")
     market_overview.sort(key=lambda x: x["change_pct"])
-    significant_dips.sort(key=lambda x: x["change_pct"])
+
+    # On sélectionne les 5 actions qui ont le plus chuté aujourd'hui
+    top_drops = market_overview[:5]
 
     top_losers_text = ""
-    for item in market_overview[:5]:
+    for item in top_drops:
         emoji = "🔴" if item["change_pct"] < 0 else "🟢"
         top_losers_text += f"{emoji} **{item['ticker']}**: `{item['price']:.2f} {item['currency']}` (*{item['change_pct']:.2f}%*) | Expert view: **{item['recommendation']}**\n"
 
+    # Détection d'une opportunité en or : Grosse chute (<-4%) + Avis positif d'experts (BUY ou STRONG_BUY)
     golden_opportunities = [
-        d for d in significant_dips 
-        if d["change_pct"] <= -5.0 and d["recommendation"] in ["BUY", "STRONG_BUY"]
+        d for d in top_drops 
+        if d["change_pct"] <= -4.0 and d["recommendation"] in ["BUY", "STRONG_BUY"]
     ]
 
+    # 1. Alerte VIP avec ping direct si une forte baisse a un avis "Buy" d'expert
     if golden_opportunities:
         for opp in golden_opportunities:
-            ping_text = f"<@{MY_DISCORD_ID}> 🚨 **MAJOR DIP OPPORTUNITY DETECTED!**"
+            ping_text = f"<@{MY_DISCORD_ID}> 🚨 **HIGH-POTENTIAL DIP DETECTED!**"
             embed = {
-                "title": f"📉 Expert-Backed Dip: {opp['ticker']} is down {opp['change_pct']:.2f}%!",
+                "title": f"📉 Growth Stock Dip: {opp['ticker']} dropped {opp['change_pct']:.2f}%!",
                 "description": (
-                    f"**{opp['ticker']}** has dropped sharply to **{opp['price']:.2f} {opp['currency']}**.\n\n"
-                    f"👔 **Expert Consensus:** `{opp['recommendation']}`\n"
-                    f"🎯 **Analyst Target Price:** `{opp['target_price']:.2f} {opp['currency']}`\n\n"
-                    f"👉 This stock is heavily discounted while experts still rate it as a buy."
+                    f"**{opp['ticker']}** has experienced a sharp pullback to **{opp['price']:.2f} {opp['currency']}**.\n\n"
+                    f"👔 **Analyst Consensus:** `{opp['recommendation']}`\n"
+                    f"🎯 **Expert Target Price:** `{opp['target_price']:.2f} {opp['currency']}`\n\n"
+                    f"👉 Significant drop on a growth asset while experts maintain a 'Buy' rating. Potential rebound opportunity!"
                 ),
                 "color": 16711680,
-                "footer": {"text": f"Stock Market Monitor • {date_str}"}
+                "footer": {"text": f"Growth Stock Monitor • {date_str}"}
             }
-            send_discord_message({"username": "Stock Expert Bot", "content": ping_text, "embeds": [embed]})
+            send_discord_message({"username": "Growth Stock Bot", "content": ping_text, "embeds": [embed]})
 
+    # 2. Rapport quotidien avec les plus grosses chutes du segment croissance
     daily_embed = {
-        "title": f"📊 Daily Stock Market & Expert Report — {now_be.strftime('%d %B %Y')}",
+        "title": f"🚀 Growth & Volatile Stocks Report — {now_be.strftime('%d %B %Y')}",
         "description": (
-            f"Here is your daily market pulse on monitored assets.\n\n"
-            f"📉 **Top Movers / Biggest Drops Today:**\n{top_losers_text}\n"
-            f"💡 *Scanned daily for sudden drops backed by analyst 'BUY' ratings.*"
+            f"Here are the **biggest market drops** today among high-potential growth and tech stocks.\n\n"
+            f"📉 **Top Dips / Biggest Losers Today:**\n{top_losers_text}\n"
+            f"💡 *Tracking potential recovery plays backed by analyst ratings.*"
         ),
         "color": 3447003,
-        "footer": {"text": "Stock Market Monitor • Automated Daily Update"}
+        "footer": {"text": "Growth Stock Monitor • Daily Pulse"}
     }
     
     send_discord_message({
-        "username": "Stock Expert Bot", 
-        "content": "📊 **Daily stock market update:**" if not golden_opportunities else "📊 **Daily Market Report + VIP Alert sent above!**", 
+        "username": "Growth Stock Bot", 
+        "content": "🚀 **Daily growth stock market update:**" if not golden_opportunities else "🚀 **Daily Report + VIP Opportunity Alert sent above!**", 
         "embeds": [daily_embed]
     })
 
-    print("=== STOCK CHECK COMPLETE ===")
+    print("=== GROWTH CHECK COMPLETE ===")
 
 if __name__ == "__main__":
     main()
