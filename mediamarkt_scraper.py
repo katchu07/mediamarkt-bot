@@ -2,7 +2,8 @@ import asyncio
 import os
 import re
 import random
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
 from urllib.parse import urljoin
 from playwright.async_api import async_playwright
@@ -11,15 +12,23 @@ from playwright_stealth import Stealth
 # ==========================================
 # SETTINGS
 # ==========================================
-MIN_DISCOUNT = 50.0  
+MIN_DISCOUNT = 50.0
 MAX_ALERTS_PER_RUN = 5
 
-REPORT_HOUR = 18      # Test-uur (zet straks op 22)
-REPORT_MINUTE = 10    # Test-minuut (zet straks op 0)
+REPORT_HOUR = 22
+REPORT_MINUTE = 0
 
 BASE_URL = "https://outlet.mediamarkt.be/"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
 MEMORY_FILE = "gevonden_deals.txt"
+TZ = ZoneInfo("Europe/Brussels")
+
+# Badge rouge = texte du type "-15%" ou "-15 %"
+BADGE_REGEX = re.compile(r"^-\s*(\d{1,2})\s*%$")
+BADGE_IN_TEXT = re.compile(r"(?<![\w.])-\s*(\d{1,2})\s*%")
+# Code produit type (CP.MA.00000779.01) : on l'enlève du texte
+PRODUCT_CODE = re.compile(r"\(?\bCP\.[A-Z]+\.\d+\.\d+\)?")
+
 
 def load_seen_deals() -> set:
     if not os.path.exists(MEMORY_FILE):
@@ -27,9 +36,11 @@ def load_seen_deals() -> set:
     with open(MEMORY_FILE, "r", encoding="utf-8") as f:
         return set(line.strip() for line in f if line.strip())
 
+
 def save_seen_deal(key: str):
     with open(MEMORY_FILE, "a", encoding="utf-8") as f:
         f.write(f"{key}\n")
+
 
 def parse_eu_number(val_str: str) -> float:
     clean = val_str.strip().strip(",.-")
@@ -47,51 +58,69 @@ def parse_eu_number(val_str: str) -> float:
     except ValueError:
         return 0.0
 
-def analyze_card_text(text: str):
-    discount_pct = 0.0
-    old_price = 0.0
-    new_price = 0.0
-    
-    pct_matches = re.findall(r"-\s*(\d+(?:[.,]\d+)?)\s*%|(\d+(?:[.,]\d+)?)\s*%", text)
-    for m in pct_matches:
-        val = parse_eu_number(m[0] or m[1])
-        if 5.0 <= val <= 95.0:
-            discount_pct = max(discount_pct, val)
 
-    price_matches = re.findall(r"(?:€\s*)?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}|[.,]-))(?:\s*€)?|€\s*(\d+(?:[.,]\d+)?)", text)
-    prices = []
-    for pm in price_matches:
-        p_val = parse_eu_number((pm[0] or pm[1]).replace(",-", "").replace(".-", ""))
-        if 5.0 <= p_val <= 15000.0:
-            prices.append(p_val)
+def extract_prices_for_display(text: str):
+    """Prix uniquement pour l'AFFICHAGE (jamais utilisés pour calculer la promo)."""
+    clean = PRODUCT_CODE.sub(" ", text)
+    found = re.findall(r"€\s*(\d+(?:[.,]\d{3})*(?:[.,]\d{2}|[.,]-)?)", clean)
+    prices = [parse_eu_number(p) for p in found]
+    prices = [p for p in prices if 1.0 <= p <= 15000.0]
+    if not prices:
+        return 0.0, 0.0
+    if len(prices) == 1:
+        return 0.0, prices[0]
+    return max(prices), min(prices)
 
-    unique_prices = sorted(list(set(prices)))
-    if len(unique_prices) >= 2:
-        new_price = unique_prices[0]
-        old_price = unique_prices[-1]
-        if old_price > new_price:
-            calc = ((old_price - new_price) / old_price) * 100.0
-            if calc <= 95.0:
-                discount_pct = max(discount_pct, calc)
-    elif len(unique_prices) == 1:
-        new_price = unique_prices[0]
 
-    return old_price, new_price, discount_pct
+async def read_badge(card):
+    """Lit UNIQUEMENT le pourcentage affiché (badge rouge). Retourne None si pas fiable."""
+    badges = []
 
-def send_discord_deal(title: str, old_price: float, new_price: float, discount: float, url: str, now_str: str):
+    # 1) Éléments dont le texte entier est "-15%"
+    try:
+        els = await card.locator("span, div, p, b, strong, small").all()
+        for el in els:
+            try:
+                t = (await el.inner_text(timeout=500)).strip()
+            except Exception:
+                continue
+            m = BADGE_REGEX.match(t)
+            if m:
+                badges.append(float(m.group(1)))
+    except Exception:
+        pass
+
+    # 2) Secours : regex sur le texte, sans les codes produit
+    if not badges:
+        text = PRODUCT_CODE.sub(" ", await card.inner_text())
+        badges = [float(x) for x in BADGE_IN_TEXT.findall(text)]
+
+    if not badges:
+        return None
+
+    # Si plusieurs badges différents, la "carte" contient plusieurs produits -> on ignore
+    if len(set(badges)) > 1:
+        return None
+
+    return badges[0]
+
+
+def send_discord_deal(title, old_price, new_price, discount, url, now_str):
     if not DISCORD_WEBHOOK_URL:
         return
-    
-    old_str = f"€ {old_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if old_price > 0 else "See website"
-    new_str = f"€ {new_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if new_price > 0 else "See website"
+
+    def fmt(v):
+        if v <= 0:
+            return "Voir le site"
+        return f"€ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
     if discount >= 70.0:
-        header = f"🚨 INSANE DEAL: -{discount:.1f}% OFF!"
-        ping = f"@everyone 🔥 **MediaMarkt Outlet just dropped a -{discount:.1f}% deal!**"
+        header = f"🚨 INSANE DEAL: -{discount:.0f}% OFF!"
+        ping = f"@everyone 🔥 **MediaMarkt Outlet just dropped a -{discount:.0f}% deal!**"
         color = 16711680
     else:
-        header = f"🔥 MASSIVE DEAL FOUND: -{discount:.1f}% OFF!"
-        ping = f"@everyone ⚡ **New -{discount:.1f}% discount found on MediaMarkt Outlet!**"
+        header = f"🔥 MASSIVE DEAL FOUND: -{discount:.0f}% OFF!"
+        ping = f"@everyone ⚡ **New -{discount:.0f}% discount found on MediaMarkt Outlet!**"
         color = 16753920
 
     embed = {
@@ -100,15 +129,20 @@ def send_discord_deal(title: str, old_price: float, new_price: float, discount: 
         "url": url,
         "color": color,
         "fields": [
-            {"name": "🏷️ Old Price", "value": f"~~{old_str}~~", "inline": True},
-            {"name": "💶 Outlet Price", "value": f"**{new_str}**", "inline": True},
-            {"name": "📉 Discount", "value": f"**-{discount:.1f}%**", "inline": True}
+            {"name": "🏷️ Old Price", "value": f"~~{fmt(old_price)}~~", "inline": True},
+            {"name": "💶 Outlet Price", "value": f"**{fmt(new_price)}**", "inline": True},
+            {"name": "📉 Discount (badge)", "value": f"**-{discount:.0f}%**", "inline": True},
         ],
-        "footer": {"text": f"MediaMarkt Outlet Monitor • {now_str}"}
+        "footer": {"text": f"MediaMarkt Outlet Monitor • {now_str}"},
     }
-    requests.post(DISCORD_WEBHOOK_URL, json={"username": "MediaMarkt Outlet Bot", "content": ping, "embeds": [embed]}, timeout=10)
+    requests.post(
+        DISCORD_WEBHOOK_URL,
+        json={"username": "MediaMarkt Outlet Bot", "content": ping, "embeds": [embed]},
+        timeout=10,
+    )
 
-def send_daily_report(total_found_today: int, max_seen_discount: float, max_seen_title: str, date_str: str, time_str: str):
+
+def send_daily_report(total_found_today, max_seen_discount, max_seen_title, date_str, time_str):
     if not DISCORD_WEBHOOK_URL:
         return
 
@@ -123,18 +157,23 @@ def send_daily_report(total_found_today: int, max_seen_discount: float, max_seen
     embed = {
         "title": f"🌙 Daily Status Report ({REPORT_HOUR:02d}:{REPORT_MINUTE:02d}) — {date_str}",
         "description": (
-            f"The bot is **100% active** and scanning smoothly (sorted *Oldest to Newest*).\n\n"
+            f"The bot is **100% active** and scanning smoothly.\n\n"
             f"{status_line}\n"
             f"📊 **Highest discount currently on the Outlet:** `-{max_seen_discount:.0f}%` *(e.g. {max_seen_title[:50]}...)*\n\n"
             f"All systems are fully operational!"
         ),
         "color": embed_color,
-        "footer": {"text": f"MediaMarkt 24/7 Cloud Monitor • Report sent at {time_str}"}
+        "footer": {"text": f"MediaMarkt 24/7 Cloud Monitor • Report sent at {time_str}"},
     }
-    requests.post(DISCORD_WEBHOOK_URL, json={"username": "MediaMarkt Outlet Bot", "embeds": [embed]}, timeout=10)
+    requests.post(
+        DISCORD_WEBHOOK_URL,
+        json={"username": "MediaMarkt Outlet Bot", "embeds": [embed]},
+        timeout=10,
+    )
     print("   [DISCORD] ✅ Daily status report sent!")
 
-async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent: int, highest_tracker: dict, now_str: str, today_str: str) -> int:
+
+async def scan_page_products(page, target_url, seen_deals, alerts_sent, highest_tracker, now_str, today_str):
     try:
         await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
         await page.wait_for_timeout(2500)
@@ -144,7 +183,7 @@ async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent
         print(f"   [!] Could not open {target_url}: {e}")
         return alerts_sent
 
-    cards = await page.locator("div.product-layout, div.product-thumb, div.product, div:has(> div > a:has-text('Meer info')), div:has(> a:has-text('Meer info'))").all()
+    cards = await page.locator("div.product-layout, div.product-thumb, div.product").all()
 
     for card in cards:
         if alerts_sent >= MAX_ALERTS_PER_RUN:
@@ -154,19 +193,22 @@ async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent
             if not text or len(text.strip()) < 10:
                 continue
 
-            link_el = card.locator("a[href*='product'], a:has-text('Meer info'), a:has-text('Winkelwagen'), a[href]").first
+            link_el = card.locator("a[href*='product'], a:has-text('Meer info'), a[href]").first
             if await link_el.count() == 0:
                 continue
             href = await link_el.get_attribute("href")
             product_url = urljoin(BASE_URL, href) if href else BASE_URL
 
-            title_match = re.split(r'\n', text.strip())
-            title = title_match[0] if title_match else "MediaMarkt Product"
-            if "Als nieuw" in title or "Korting" in title or "€" in title or "-" in title[:3]:
-                title = title_match[1] if len(title_match) > 1 else title
+            lines = [l for l in re.split(r"\n", text.strip()) if l.strip()]
+            title = lines[0] if lines else "MediaMarkt Product"
+            if "Als nieuw" in title or "Korting" in title or "€" in title or title.strip().startswith("-"):
+                title = lines[1] if len(lines) > 1 else title
             title = re.sub(r"\s+", " ", title)[:120]
 
-            old_price, new_price, discount_pct = analyze_card_text(text)
+            # On LIT simplement le pourcentage affiché, sans aucun calcul
+            discount_pct = await read_badge(card)
+            if discount_pct is None:
+                continue
 
             if discount_pct > highest_tracker["pct"]:
                 highest_tracker["pct"] = discount_pct
@@ -176,24 +218,26 @@ async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent
                 continue
 
             if discount_pct >= MIN_DISCOUNT:
-                print(f"   🔥 MATCH FOUND: {title} | -{discount_pct:.1f}%")
+                old_price, new_price = extract_prices_for_display(text)
+                print(f"   🔥 MATCH FOUND: {title} | -{discount_pct:.0f}%")
                 send_discord_deal(title, old_price, new_price, discount_pct, product_url, now_str)
-                
+
                 save_seen_deal(product_url)
                 seen_deals.add(product_url)
-                
+
                 daily_deal_key = f"DEAL_{today_str}_{product_url}"
                 save_seen_deal(daily_deal_key)
                 seen_deals.add(daily_deal_key)
-                
+
                 alerts_sent += 1
         except Exception:
             continue
 
     return alerts_sent
 
+
 async def main():
-    now_be = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=2)))
+    now_be = datetime.now(TZ)
     now_str = now_be.strftime("%H:%M:%S")
     today_str = now_be.strftime("%Y-%m-%d")
 
@@ -203,16 +247,20 @@ async def main():
     highest_tracker = {"pct": 0.0, "title": "Unknown"}
 
     async with Stealth().use_async(async_playwright()) as p:
-        browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            locale="nl-BE", timezone_id="Europe/Brussels"
+            locale="nl-BE",
+            timezone_id="Europe/Brussels",
         )
         page = await context.new_page()
 
         await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
         links = await page.locator("a[href*='route=product/category'], nav a[href], .menu a[href]").all()
-        
+
         main_categories = []
         for link in links:
             href = await link.get_attribute("href")
@@ -226,7 +274,7 @@ async def main():
                 f"{BASE_URL}index.php?route=product/category&path=7060",
                 f"{BASE_URL}index.php?route=product/category&path=6966",
                 f"{BASE_URL}index.php?route=product/category&path=6991",
-                f"{BASE_URL}index.php?route=product/category&path=7095"
+                f"{BASE_URL}index.php?route=product/category&path=7095",
             ])
 
         random.shuffle(main_categories)
@@ -236,7 +284,9 @@ async def main():
             if alerts_sent >= MAX_ALERTS_PER_RUN:
                 break
             sorted_url = f"{cat_url}&sort=p.date_added&order=ASC&limit=50"
-            alerts_sent = await scan_page_products(page, sorted_url, seen_deals, alerts_sent, highest_tracker, now_str, today_str)
+            alerts_sent = await scan_page_products(
+                page, sorted_url, seen_deals, alerts_sent, highest_tracker, now_str, today_str
+            )
 
         await browser.close()
 
@@ -247,7 +297,8 @@ async def main():
         send_daily_report(total_found_today, highest_tracker["pct"], highest_tracker["title"], today_str, now_str)
         save_seen_deal(report_flag)
 
-    print(f"=== DONE! Highest discount seen: -{highest_tracker['pct']:.1f}% | Found today: {total_found_today} ===")
+    print(f"=== DONE! Highest discount seen: -{highest_tracker['pct']:.0f}% | Found today: {total_found_today} ===")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
