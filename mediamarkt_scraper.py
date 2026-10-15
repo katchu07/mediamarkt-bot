@@ -3,15 +3,16 @@ import os
 import re
 import random
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
 from urllib.parse import urljoin
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
 # ==========================================
-# INSTELLINGEN
+# SETTINGS
 # ==========================================
-MIN_DISCOUNT = 50.0  # Pakt alles vanaf 50% en hoger!
+MIN_DISCOUNT = 50.0  # Automatically detects any discount of 50% or higher (50%, 55%, 60%, 70%+)
 MAX_ALERTS_PER_RUN = 5
 
 BASE_URL = "https://outlet.mediamarkt.be/"
@@ -24,9 +25,9 @@ def load_seen_deals() -> set:
     with open(MEMORY_FILE, "r", encoding="utf-8") as f:
         return set(line.strip() for line in f if line.strip())
 
-def save_seen_deal(url: str):
+def save_seen_deal(key: str):
     with open(MEMORY_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{url}\n")
+        f.write(f"{key}\n")
 
 def parse_eu_number(val_str: str) -> float:
     clean = val_str.strip().strip(",.-")
@@ -75,49 +76,67 @@ def analyze_card_text(text: str):
 
     return old_price, new_price, discount_pct
 
-def send_discord_deal(title: str, old_price: float, new_price: float, discount: float, url: str):
+def send_discord_deal(title: str, old_price: float, new_price: float, discount: float, url: str, now_str: str):
     if not DISCORD_WEBHOOK_URL:
         return
     
-    old_str = f"€ {old_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if old_price > 0 else "Zie site"
-    new_str = f"€ {new_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if new_price > 0 else "Zie site"
+    old_str = f"€ {old_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if old_price > 0 else "See website"
+    new_str = f"€ {new_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if new_price > 0 else "See website"
 
-    # Nu 50%+ de standaard is, maken we de 70%+ deals extra opvallend
     if discount >= 70.0:
-        header = f"🚨 BIZARRE DEAL: -{discount:.1f}% KORTING!"
-        ping = f"@everyone 🔥 **MediaMarkt Outlet dumpt dit voor -{discount:.1f}%!**"
+        header = f"🚨 INSANE DEAL: -{discount:.1f}% OFF!"
+        ping = f"@everyone 🔥 **MediaMarkt Outlet just dropped a -{discount:.1f}% deal!**"
         color = 16711680
     else:
-        header = f"✅ DEAL GEVONDEN: -{discount:.1f}% Korting!"
-        ping = f"⚡ **Dikke deal gevonden (-{discount:.1f}%)!**"
+        header = f"🔥 MASSIVE DEAL FOUND: -{discount:.1f}% OFF!"
+        ping = f"@everyone ⚡ **New -{discount:.1f}% discount found on MediaMarkt Outlet!**"
         color = 16753920
 
     embed = {
         "title": header,
-        "description": f"**[{title}]({url})**\n\n👉 **[Open direct op MediaMarkt Outlet]({url})**",
+        "description": f"**[{title}]({url})**\n\n👉 **[Click here to open on MediaMarkt Outlet]({url})**",
         "url": url,
         "color": color,
         "fields": [
-            {"name": "🏷️ Oude Prijs", "value": f"~~{old_str}~~", "inline": True},
-            {"name": "💶 Outlet Prijs", "value": f"**{new_str}**", "inline": True},
-            {"name": "📉 Korting", "value": f"**-{discount:.1f}%**", "inline": True}
+            {"name": "🏷️ Old Price", "value": f"~~{old_str}~~", "inline": True},
+            {"name": "💶 Outlet Price", "value": f"**{new_str}**", "inline": True},
+            {"name": "📉 Discount", "value": f"**-{discount:.1f}%**", "inline": True}
         ],
-        "footer": {"text": f"MediaMarkt Outlet Monitor • {datetime.now().strftime('%H:%M:%S')}"}
+        "footer": {"text": f"MediaMarkt Outlet Monitor • {now_str}"}
     }
-    requests.post(DISCORD_WEBHOOK_URL, json={"username": "MediaMarkt Bot", "content": ping, "embeds": [embed]}, timeout=10)
+    requests.post(DISCORD_WEBHOOK_URL, json={"username": "MediaMarkt Outlet Bot", "content": ping, "embeds": [embed]}, timeout=10)
 
-async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent: int) -> int:
+def send_daily_22h_report(max_seen_discount: float, max_seen_title: str, date_str: str):
+    """Sends a daily status check at 22:00 confirming the bot is working and showing the highest discount found."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    embed = {
+        "title": f"🌙 Daily Status Check (22:00) — {date_str}",
+        "description": (
+            f"The bot is **100% active** and running smoothly in the background (sorted *Oldest to Newest*).\n\n"
+            f"❌ **No deals of >={MIN_DISCOUNT:.0f}% found today.**\n"
+            f"📊 **Highest discount currently on the Outlet:** `-{max_seen_discount:.0f}%` *(e.g. {max_seen_title[:50]}...)*\n\n"
+            f"As soon as MediaMarkt raises the discount limit to **{MIN_DISCOUNT:.0f}%+**, you will receive an instant `@everyone` alert!"
+        ),
+        "color": 3447003,
+        "footer": {"text": "MediaMarkt 24/7 Cloud Monitor • All systems operational"}
+    }
+    requests.post(DISCORD_WEBHOOK_URL, json={"username": "MediaMarkt Outlet Bot", "embeds": [embed]}, timeout=10)
+    print("   [DISCORD] ✅ 22:00 Daily report sent!")
+
+async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent: int, highest_tracker: dict, now_str: str) -> int:
     try:
         await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
         await page.wait_for_timeout(2500)
-        await page.evaluate("window.scrollBy(0, 800)")
+        await page.evaluate("window.scrollBy(0, 700)")
         await page.wait_for_timeout(1500)
     except Exception as e:
-        print(f"   [!] Fout bij openen {target_url}: {e}")
+        print(f"   [!] Could not open {target_url}: {e}")
         return alerts_sent
 
     cards = await page.locator("div.product-layout, div.product-thumb, div.product, div:has(> div > a:has-text('Meer info')), div:has(> a:has-text('Meer info'))").all()
-    print(f"   -> {len(cards)} producten ontdekt op {target_url.split('&path=')[-1] if '&path=' in target_url else 'Voorpagina'}")
+    print(f"   -> {len(cards)} products checked (Oldest to Newest) on {target_url.split('&path=')[-1]}")
 
     for card in cards:
         if alerts_sent >= MAX_ALERTS_PER_RUN:
@@ -133,10 +152,6 @@ async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent
             href = await link_el.get_attribute("href")
             product_url = urljoin(BASE_URL, href) if href else BASE_URL
 
-            # Bij de echte 50% scan blokkeren we duplicaten strikt!
-            if product_url in seen_deals:
-                continue
-
             title_match = re.split(r'\n', text.strip())
             title = title_match[0] if title_match else "MediaMarkt Product"
             if "Als nieuw" in title or "Korting" in title or "€" in title or "-" in title[:3]:
@@ -145,9 +160,16 @@ async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent
 
             old_price, new_price, discount_pct = analyze_card_text(text)
 
+            if discount_pct > highest_tracker["pct"]:
+                highest_tracker["pct"] = discount_pct
+                highest_tracker["title"] = title
+
+            if product_url in seen_deals:
+                continue
+
             if discount_pct >= MIN_DISCOUNT:
-                print(f"   🔥 {discount_pct:.1f}% KORTING GEVONDEN: {title}")
-                send_discord_deal(title, old_price, new_price, discount_pct, product_url)
+                print(f"   🔥 MATCH FOUND: {title} | -{discount_pct:.1f}%")
+                send_discord_deal(title, old_price, new_price, discount_pct, product_url, now_str)
                 save_seen_deal(product_url)
                 seen_deals.add(product_url)
                 alerts_sent += 1
@@ -157,9 +179,14 @@ async def scan_page_products(page, target_url: str, seen_deals: set, alerts_sent
     return alerts_sent
 
 async def main():
-    print(f"=== START RANDOM DIEPTE-SCAN (Filter: >= {MIN_DISCOUNT}%) ===")
+    now_be = datetime.now(ZoneInfo("Europe/Brussels"))
+    now_str = now_be.strftime("%H:%M:%S")
+    today_str = now_be.strftime("%Y-%m-%d")
+
+    print(f"=== START SMART SCAN ({today_str} {now_str}) | Filter: >= {MIN_DISCOUNT}% ===")
     seen_deals = load_seen_deals()
     alerts_sent = 0
+    highest_tracker = {"pct": 0.0, "title": "Unknown"}
 
     async with Stealth().use_async(async_playwright()) as p:
         browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
@@ -169,46 +196,52 @@ async def main():
         )
         page = await context.new_page()
 
-        print("1. Categorieën ophalen vanaf voorpagina...")
         await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
-        
         links = await page.locator("a[href*='route=product/category'], nav a[href], .menu a[href]").all()
-        categories = []
+        
+        main_categories = []
         for link in links:
             href = await link.get_attribute("href")
-            if href:
+            if href and "route=product/category&path=" in href:
                 full_url = urljoin(BASE_URL, href)
-                if full_url.startswith(BASE_URL) and full_url != BASE_URL and full_url not in categories:
-                    categories.append(full_url)
+                if "_" not in full_url.split("path=")[-1] and full_url not in main_categories:
+                    main_categories.append(full_url)
 
-        # We pakken 3 willekeurige categorieën uit de hele lijst
-        random.shuffle(categories)
-        target_cats = categories[:3]
-        
-        # We voegen ook bewust de voorpagina toe om recente flitsdeals niet te missen
-        target_cats.append(BASE_URL)
+        if len(main_categories) < 4:
+            main_categories.extend([
+                f"{BASE_URL}index.php?route=product/category&path=7060",
+                f"{BASE_URL}index.php?route=product/category&path=6966",
+                f"{BASE_URL}index.php?route=product/category&path=6991",
+                f"{BASE_URL}index.php?route=product/category&path=7095"
+            ])
 
-        for cat_url in target_cats:
+        random.shuffle(main_categories)
+        selected_cats = list(dict.fromkeys(main_categories))[:4]
+
+        for cat_url in selected_cats:
             if alerts_sent >= MAX_ALERTS_PER_RUN:
                 break
-            
-            # Bepaal willekeurige paginanummers om diep in het assortiment te prikken (ouder voorraad)
-            # Voorblad krijgt uiteraard geen paginanummer, categorieën krijgen 2 willekeurige pagina's
-            if cat_url == BASE_URL:
-                random_pages = [1]
-            else:
-                random_pages = [random.randint(1, 3), random.randint(4, 9)]
-
-            for page_num in set(random_pages):
-                if alerts_sent >= MAX_ALERTS_PER_RUN:
-                    break
-                
-                scan_url = f"{cat_url}&page={page_num}" if "?" in cat_url and page_num > 1 else cat_url
-                print(f"\n[SCANNEN] Categorie URL: {scan_url}")
-                alerts_sent = await scan_page_products(page, scan_url, seen_deals, alerts_sent)
+            # &limit=50 displays 50 products per page instead of 15!
+            sorted_url = f"{cat_url}&sort=p.date_added&order=ASC&limit=50"
+            alerts_sent = await scan_page_products(page, sorted_url, seen_deals, alerts_sent, highest_tracker, now_str)
 
         await browser.close()
-        print(f"\n=== KLAAR! Totaal {alerts_sent} deal-melding(en) >50% verstuurd. ===")
+
+    if alerts_sent > 0:
+        deal_flag = f"DEAL_FOUND_{today_str}"
+        if deal_flag not in seen_deals:
+            save_seen_deal(deal_flag)
+            seen_deals.add(deal_flag)
+
+    report_flag = f"DAILY_REPORT_{today_str}"
+    deal_flag = f"DEAL_FOUND_{today_str}"
+
+    if now_be.hour == 22 and report_flag not in seen_deals:
+        if deal_flag not in seen_deals and alerts_sent == 0:
+            send_daily_22h_report(highest_tracker["pct"], highest_tracker["title"], today_str)
+        save_seen_deal(report_flag)
+
+    print(f"=== DONE! Highest discount seen this run: -{highest_tracker['pct']:.1f}% | Alerts sent: {alerts_sent} ===")
 
 if __name__ == "__main__":
     asyncio.run(main())
