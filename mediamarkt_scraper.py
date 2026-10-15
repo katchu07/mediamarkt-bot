@@ -8,10 +8,9 @@ from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
 # ==========================================
-# PAS HIER JE KORTINGSPERCENTAGE AAN:
+# TEST MODUS:
 # ==========================================
-MIN_DISCOUNT = 15.0  # Nu op 15% om te testen! Zet na een succesvolle test op 50.0 of 60.0
-
+MIN_DISCOUNT = 15.0  
 MAX_ALERTS_PER_RUN = 3
 BASE_URL = "https://outlet.mediamarkt.be/"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
@@ -44,63 +43,53 @@ def parse_eu_number(val_str: str) -> float:
         return 0.0
 
 def analyze_card_text(text: str):
-    """Haalt slim kortingspercentages én oude/nieuwe prijzen uit de ruwe tekst van een productblok."""
     discount_pct = 0.0
     old_price = 0.0
     new_price = 0.0
-
-    # 1. Zoek naar expliciete percentages in de tekst (bijv. "-20%" of "25 %")
+    
+    # Zoek naar kortingspercentages
     pct_matches = re.findall(r"-\s*(\d+(?:[.,]\d+)?)\s*%|(\d+(?:[.,]\d+)?)\s*%", text)
     for m in pct_matches:
-        val_str = m[0] or m[1]
-        val = parse_eu_number(val_str)
+        val = parse_eu_number(m[0] or m[1])
         if 5.0 <= val <= 95.0:
             discount_pct = max(discount_pct, val)
 
-    # 2. Zoek naar alle bedragen in de tekst (bijv. € 499,00 of 499,99 € of 499.-)
+    # Zoek naar europrijzen
     price_matches = re.findall(r"(?:€\s*)?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}|[.,]-))(?:\s*€)?|€\s*(\d+(?:[.,]\d+)?)", text)
     prices = []
     for pm in price_matches:
-        raw_p = (pm[0] or pm[1]).replace(",-", "").replace(".-", "")
-        p_val = parse_eu_number(raw_p)
+        p_val = parse_eu_number((pm[0] or pm[1]).replace(",-", "").replace(".-", ""))
         if 5.0 <= p_val <= 15000.0:
             prices.append(p_val)
 
-    # Als we minstens 2 bedragen in één productblok zien, is de hoogste de oude prijs en de laagste de outletprijs
     unique_prices = sorted(list(set(prices)))
     if len(unique_prices) >= 2:
         new_price = unique_prices[0]
         old_price = unique_prices[-1]
         if old_price > new_price:
-            calc_pct = ((old_price - new_price) / old_price) * 100.0
-            if calc_pct <= 95.0:
-                discount_pct = max(discount_pct, calc_pct)
+            calc = ((old_price - new_price) / old_price) * 100.0
+            if calc <= 95.0:
+                discount_pct = max(discount_pct, calc)
     elif len(unique_prices) == 1:
         new_price = unique_prices[0]
 
     return old_price, new_price, discount_pct
 
-def send_discord_message(payload: dict):
-    if not DISCORD_WEBHOOK_URL:
-        print("❌ FOUT: DISCORD_WEBHOOK secret is leeg! Controleer Settings -> Secrets and variables -> Actions.")
-        return
-    try:
-        res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        print(f"   [DISCORD] Verzonden! HTTP Status: {res.status_code}")
-    except Exception as e:
-        print(f"   [DISCORD FOUT] {e}")
-
 def send_discord_deal(title: str, old_price: float, new_price: float, discount: float, url: str):
+    if not DISCORD_WEBHOOK_URL:
+        print("❌ FOUT: Geen Discord URL gevonden in de kluis!")
+        return
+    
     old_str = f"€ {old_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if old_price > 0 else "Zie site"
     new_str = f"€ {new_price:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if new_price > 0 else "Zie site"
 
     if discount >= 50.0:
-        header = f"🚨 KORTINGSLIMIET VERHOOGD: -{discount:.1f}% DEAL! 🚨"
+        header = f"🚨 EXTREME DEAL: -{discount:.1f}% KORTING!"
         ping = f"@everyone 🔥 **MediaMarkt Outlet zit nu op -{discount:.1f}% korting!**"
         color = 16711680
     else:
         header = f"✅ DEAL GEVONDEN: -{discount:.1f}% Korting!"
-        ping = f"⚡ **Deal gevonden met -{discount:.1f}% korting (Filter: >={MIN_DISCOUNT:.0f}%)**"
+        ping = f"⚡ **Nieuwe deal gevonden (-{discount:.1f}%)!**"
         color = 16753920
 
     embed = {
@@ -115,12 +104,23 @@ def send_discord_deal(title: str, old_price: float, new_price: float, discount: 
         ],
         "footer": {"text": f"MediaMarkt Outlet Monitor • {datetime.now().strftime('%H:%M:%S')}"}
     }
-    send_discord_message({"username": "MediaMarkt Outlet Bot", "content": ping, "embeds": [embed]})
+    requests.post(DISCORD_WEBHOOK_URL, json={"username": "MediaMarkt Outlet Bot", "content": ping, "embeds": [embed]}, timeout=10)
 
 async def scan_page_products(page, seen_deals: set, alerts_sent: int) -> int:
-    # Zoek alle mogelijke productcontainers op de pagina
-    cards = await page.locator(".product-layout, .product-thumb, .product-item, .product-card, article, .product").all()
-    print(f"-> {len(cards)} productblokken gevonden op pagina: {page.url}")
+    # We wachten extra lang en scrollen naar beneden om de plaatjes in te laden
+    await page.wait_for_timeout(3500)
+    await page.evaluate("window.scrollBy(0, 700)")
+    await page.wait_for_timeout(2000)
+
+    # NIEUWE SELECTOR: Hij zoekt nu keihard naar de knop 'Meer info' uit jouw screenshot!
+    cards = await page.locator("div.product-layout, div.product-thumb, div.product, div:has(> div > a:has-text('Meer info')), div:has(> a:has-text('Meer info'))").all()
+    print(f"   -> {len(cards)} productblokken ontdekt op deze pagina.")
+
+    if len(cards) == 0:
+        page_title = await page.title()
+        print(f"   ⚠️ WAARSCHUWING: 0 producten! De paginatitel is: '{page_title}'")
+        if "Access Denied" in page_title or "Just a moment" in page_title or "Cloudflare" in page_title:
+            print("   🚨 BOT-DETECTIE: MediaMarkt blokkeert op dit moment de GitHub Cloud-server!")
 
     for card in cards:
         if alerts_sent >= MAX_ALERTS_PER_RUN:
@@ -130,31 +130,29 @@ async def scan_page_products(page, seen_deals: set, alerts_sent: int) -> int:
             if not text or len(text.strip()) < 10:
                 continue
 
-            # Zoek productlink
-            link_el = card.locator("a[href*='product'], h4 a, .name a, a[href]").first
+            link_el = card.locator("a[href*='product'], a:has-text('Meer info'), a:has-text('Winkelwagen'), a[href]").first
             if await link_el.count() == 0:
                 continue
             href = await link_el.get_attribute("href")
-            if not href:
-                continue
-            product_url = urljoin(BASE_URL, href)
+            product_url = urljoin(BASE_URL, href) if href else BASE_URL
 
-            # Alleen bij echte deals (>35%) blokkeren we duplicaten, tijdens testmodus (<35%) laten we ze altijd door!
+            # In de testmodus (<35%) negeert hij duplicaten, zodat je altijd meldingen krijgt tijdens het testen!
             if MIN_DISCOUNT >= 35.0 and product_url in seen_deals:
                 continue
 
-            # Zoek titel
-            title_el = card.locator("h4 a, .name a, h2, h3, .caption a, a[href*='product']").first
-            title = (await title_el.inner_text()).strip() if await title_el.count() > 0 else text.split("\n")[0].strip()
+            # Zoek de titel op
+            title_match = re.split(r'\n', text.strip())
+            title = title_match[0] if title_match else "MediaMarkt Product"
+            if "Als nieuw" in title or "Korting" in title or "€" in title or "-" in title[:3]:
+                title = title_match[1] if len(title_match) > 1 else title
             title = re.sub(r"\s+", " ", title)[:120]
 
             old_price, new_price, discount_pct = analyze_card_text(text)
 
-            if discount_pct > 0:
-                print(f"   [CHECK] {title[:40]}... -> Oude prijs: {old_price} | Nieuw: {new_price} | Korting: -{discount_pct:.1f}%")
-
             if discount_pct >= MIN_DISCOUNT:
+                print(f"   🔥 DEAL GEVONDEN: {title} | -{discount_pct:.1f}%")
                 send_discord_deal(title, old_price, new_price, discount_pct, product_url)
+                
                 if MIN_DISCOUNT >= 35.0:
                     save_seen_deal(product_url)
                     seen_deals.add(product_url)
@@ -169,13 +167,6 @@ async def main():
     seen_deals = load_seen_deals()
     alerts_sent = 0
 
-    # Als je aan het testen bent (MIN_DISCOUNT < 35%), stuur altijd een test-signaal naar Discord
-    if MIN_DISCOUNT < 35.0:
-        send_discord_message({
-            "username": "MediaMarkt Outlet Bot",
-            "content": f"🛠️ **Test-modus actief (Filter: >={MIN_DISCOUNT:.0f}%)!** De GitHub-server is nu de MediaMarkt Outlet aan het scannen..."
-        })
-
     async with Stealth().use_async(async_playwright()) as p:
         browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled", "--no-sandbox"])
         context = await browser.new_context(
@@ -184,34 +175,15 @@ async def main():
         )
         page = await context.new_page()
 
-        print("1. Voorpagina openen...")
-        await page.goto(BASE_URL, wait_until="networkidle", timeout=45000)
-        await asyncio.sleep(2.0)
-
-        print("Pagina titel:", await page.title())
+        print("1. Jouw specifieke DJ categorie openen...")
+        # Directe aanval op de URL van jouw screenshot!
+        await page.goto(BASE_URL + "index.php?route=product/category&path=7060_7158", wait_until="domcontentloaded", timeout=60000)
         alerts_sent = await scan_page_products(page, seen_deals, alerts_sent)
 
-        # Check maximaal 4 categorieën als we nog geen 3 deals op het voorblad hadden
         if alerts_sent < MAX_ALERTS_PER_RUN:
-            links = await page.locator("a[href*='route=product/category'], nav a[href], .menu a[href]").all()
-            categories = []
-            for link in links:
-                href = await link.get_attribute("href")
-                if href:
-                    full_url = urljoin(BASE_URL, href)
-                    if full_url.startswith(BASE_URL) and full_url != BASE_URL and full_url not in categories:
-                        categories.append(full_url)
-
-            print(f"Gevonden categorie-links: {len(categories)}")
-            for cat_url in categories[:4]:
-                if alerts_sent >= MAX_ALERTS_PER_RUN:
-                    break
-                try:
-                    await page.goto(cat_url, wait_until="domcontentloaded", timeout=45000)
-                    await asyncio.sleep(1.5)
-                    alerts_sent = await scan_page_products(page, seen_deals, alerts_sent)
-                except Exception:
-                    continue
+            print("2. Voorpagina checken...")
+            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+            alerts_sent = await scan_page_products(page, seen_deals, alerts_sent)
 
         await browser.close()
         print(f"=== KLAAR! Totaal {alerts_sent} deal-melding(en) verstuurd. ===")
