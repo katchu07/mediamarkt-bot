@@ -5,7 +5,6 @@ import re
 import html
 from datetime import datetime
 
-# URL des derniers ajouts du magasin Cash Converters Evere
 URL_EVERE = "https://www.cashconverters.be/nl/2-home?q=Winkel-EVERE&order=product.date_add.desc"
 
 HEADERS_JSON = {
@@ -27,18 +26,14 @@ def nettoyer_texte(texte):
     return " ".join(texte.split())
 
 def extraire_depuis_html(contenu_html):
-    """Extrait les produits directement depuis le HTML PrestaShop."""
     articles = []
-    # Découpage par bloc de produit PrestaShop (<article ...>)
     blocs = re.findall(r'<article[^>]*class=["\'][^"\']*product-miniature[^"\']*["\'][^>]*>(.*?)</article>', contenu_html, re.DOTALL | re.IGNORECASE)
     
     for bloc in blocs:
-        # Extraction du titre et du lien
         m_titre = re.search(r'<h[23][^>]*class=["\'][^"\']*product-title[^"\']*["\'][^>]*>\s*<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', bloc, re.DOTALL | re.IGNORECASE)
         if not m_titre:
             m_titre = re.search(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*product-title[^"\']*["\'][^>]*>(.*?)</a>', bloc, re.DOTALL | re.IGNORECASE)
             
-        # Extraction du prix
         m_prix = re.search(r'class=["\'][^"\']*price[^"\']*["\'][^>]*>(.*?)</span>', bloc, re.DOTALL | re.IGNORECASE)
         
         if m_titre:
@@ -51,22 +46,21 @@ def extraire_depuis_html(contenu_html):
                 "prix": prix,
                 "lien": lien
             })
-            if len(articles) == 15:
+            if len(articles) == 20:
                 break
                 
     return articles
 
-def recuperer_15_derniers_articles():
+def recuperer_20_derniers_articles():
     articles = []
     
-    # 1. Tentative via l'API JSON native de PrestaShop (plus propre et rapide)
     try:
         req = urllib.request.Request(URL_EVERE, headers=HEADERS_JSON)
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode('utf-8', errors='ignore'))
             
         if "products" in data and isinstance(data["products"], list):
-            for p in data["products"][:15]:
+            for p in data["products"][:20]:
                 nom = nettoyer_texte(p.get("name", "Article sans nom"))
                 prix = nettoyer_texte(p.get("price", p.get("regular_price", "Prix inconnu")))
                 lien = p.get("url", p.get("canonical_url", URL_EVERE))
@@ -85,7 +79,6 @@ def recuperer_15_derniers_articles():
     except Exception as e:
         print(f"Passage au mode HTML standard ({e})")
 
-    # 2. Tentative classique via la page HTML complète
     try:
         req = urllib.request.Request(URL_EVERE, headers=HEADERS_HTML)
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -94,7 +87,7 @@ def recuperer_15_derniers_articles():
     except Exception as e:
         print(f"Erreur lors de la récupération HTML : {e}")
 
-    return articles[:15]
+    return articles[:20]
 
 def envoyer_discord(articles):
     webhook_url = os.environ.get("DISCORD_WEBHOOK_CASH_EVERE")
@@ -112,7 +105,7 @@ def envoyer_discord(articles):
         description_complete = description_complete[:3995] + "..."
         
     payload = {
-        "content": f"🛒 **Cash Converters Evere — Les 15 derniers ajouts ({date_str})**",
+        "content": f"🛒 **Cash Converters Evere — Les 20 derniers ajouts ({date_str})**",
         "embeds": [
             {
                 "title": "Nouveaux arrivages en magasin (Evere)",
@@ -134,11 +127,11 @@ def envoyer_discord(articles):
     )
     
     with urllib.request.urlopen(req) as response:
-        print(f"Liste des 15 articles envoyée avec succès ! Code HTTP : {response.status}")
+        print(f"Liste des 20 articles envoyée avec succès ! Code HTTP : {response.status}")
 
 if __name__ == "__main__":
-    liste_15 = recuperer_15_derniers_articles()
-    if liste_15:
-        envoyer_discord(liste_15)
+    liste_20 = recuperer_20_derniers_articles()
+    if liste_20:
+        envoyer_discord(liste_20)
     else:
         print("Aucun article n'a pu être récupéré sur Cash Converters Evere.")
