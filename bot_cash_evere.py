@@ -23,7 +23,11 @@ def nettoyer_texte(texte):
         return ""
     texte = html.unescape(texte)
     texte = re.sub(r'<[^>]+>', '', texte)
-    return " ".join(texte.split())
+    texte = " ".join(texte.split())
+    # Met joliment la première lettre en majuscule et le reste en minuscule s'ils sont tout en minuscules
+    if texte and texte == texte.lower():
+        texte = texte.capitalize()
+    return texte
 
 def extraire_depuis_html(contenu_html):
     articles = []
@@ -96,22 +100,26 @@ def envoyer_discord(articles):
         
     date_str = datetime.now().strftime("%d/%m/%Y")
     
-    lignes = []
-    for idx, art in enumerate(articles, 1):
-        lignes.append(f"**{idx}.** [{art['nom']}]({art['lien']}) — 💰 **{art['prix']}**")
-        
-    description_complete = "\n".join(lignes)
-    if len(description_complete) > 4000:
-        description_complete = description_complete[:3995] + "..."
-        
+    # On sépare en deux listes de 10 pour faire deux champs distincts bien propres dans l'embed
+    partie_1 = articles[:10]
+    partie_2 = articles[10:]
+    
+    lignes_1 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_1, 1)]
+    lignes_2 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_2, 11)]
+    
     payload = {
-        "content": f"🛒 **Cash Converters Evere — Les 20 derniers ajouts ({date_str})**",
+        "content": f"🛒 **Cash Converters Evere — Nouveautés du {date_str}**",
         "embeds": [
             {
-                "title": "Nouveaux arrivages en magasin (Evere)",
-                "url": "https://www.cashconverters.be/nl/2-home?q=Winkel-EVERE",
-                "description": description_complete,
+                "title": "📦 Articles 1 à 10",
+                "description": "\n".join(lignes_1),
                 "color": 15844367
+            },
+            {
+                "title": "📦 Articles 11 à 20",
+                "description": "\n".join(lignes_2),
+                "color": 15844367,
+                "url": "https://www.cashconverters.be/nl/2-home?q=Winkel-EVERE"
             }
         ]
     }
@@ -127,7 +135,7 @@ def envoyer_discord(articles):
     )
     
     with urllib.request.urlopen(req) as response:
-        print(f"Liste des 20 articles envoyée avec succès ! Code HTTP : {response.status}")
+        print(f"Liste propre envoyée avec succès ! Code HTTP : {response.status}")
 
 if __name__ == "__main__":
     liste_20 = recuperer_20_derniers_articles()
