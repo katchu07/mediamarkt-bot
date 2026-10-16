@@ -5,7 +5,7 @@ import re
 import html
 from datetime import datetime
 
-# URLs des deux magasins Cash Converters
+# URLs des deux magasins Cash Converters (avec encodage propre)
 URLS_MAGASINS = [
     {
         "nom": "Magasin Evere",
@@ -67,7 +67,7 @@ def extraire_depuis_html(contenu_html):
 def recuperer_derniers_articles(url_magasin):
     articles = []
     
-    # 1. Tentative via l'API JSON PrestaShop (délai étendu à 20 secondes)
+    # 1. Tentative via l'API JSON PrestaShop
     try:
         req = urllib.request.Request(url_magasin, headers=HEADERS_JSON)
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -100,46 +100,43 @@ def recuperer_derniers_articles(url_magasin):
             page_html = resp.read().decode('utf-8', errors='ignore')
         articles = extraire_depuis_html(page_html)
     except Exception as e:
-        print(f"Erreur définitive de récupération pour ce magasin : {e}")
+        print(f"Erreur de récupération HTML pour {url_magasin} : {e}")
 
     return articles[:20]
 
-def envoyer_discord(donnees_magasins):
+def envoyer_discord_magasin(nom_magasin, articles):
     webhook_url = os.environ.get("DISCORD_WEBHOOK_CASH_EVERE")
     if not webhook_url:
         raise ValueError("Le secret DISCORD_WEBHOOK_CASH_EVERE est introuvable ou vide.")
         
+    if not articles:
+        print(f"Aucun article à envoyer pour {nom_magasin}.")
+        return
+
     date_str = datetime.now().strftime("%d/%m/%Y")
-    embeds = []
     
-    for mag in donnees_magasins:
-        nom_mag = mag["nom"]
-        articles = mag["articles"]
-        
-        if not articles:
-            continue
-            
-        partie_1 = articles[:10]
-        partie_2 = articles[10:]
-        
-        lignes_1 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_1, 1)]
+    # Séparer en deux blocs de 10 pour que chaque message reste parfaitement dans les limites Discord
+    partie_1 = articles[:10]
+    partie_2 = articles[10:]
+    
+    lignes_1 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_1, 1)]
+    embeds = [{
+        "title": f"📍 {nom_magasin} — Articles 1 à 10",
+        "description": "\n".join(lignes_1),
+        "color": 15844367
+    }]
+    
+    if partie_2:
+        lignes_2 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_2, 11)]
         embeds.append({
-            "title": f"📍 {nom_mag} — Articles 1 à 10",
-            "description": "\n".join(lignes_1),
+            "title": f"📍 {nom_magasin} — Articles 11 à 20",
+            "description": "\n".join(lignes_2),
             "color": 15844367
         })
-        
-        if partie_2:
-            lignes_2 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_2, 11)]
-            embeds.append({
-                "title": f"📍 {nom_mag} — Articles 11 à 20",
-                "description": "\n".join(lignes_2),
-                "color": 15844367
-            })
-        
+
     payload = {
-        "content": f"🛒 **Cash Converters — Nouveautés du {date_str} (Evere & Saint-Josse)**",
-        "embeds": embeds[:10]
+        "content": f"🛒 **Cash Converters — Nouveautés du {date_str} ({nom_magasin})**",
+        "embeds": embeds
     }
     
     data = json.dumps(payload).encode('utf-8')
@@ -153,19 +150,13 @@ def envoyer_discord(donnees_magasins):
     )
     
     with urllib.request.urlopen(req) as response:
-        print(f"Bilan envoyé avec succès ! Code HTTP : {response.status}")
+        print(f"Bilan envoyé avec succès pour {nom_magasin} ! Code HTTP : {response.status}")
 
 if __name__ == "__main__":
-    resultats = []
     for magasin in URLS_MAGASINS:
         print(f"Récupération pour {magasin['nom']}...")
         items = recuperer_derniers_articles(magasin["url"])
-        resultats.append({
-            "nom": magasin["nom"],
-            "articles": items
-        })
-        
-    if any(m["articles"] for m in resultats):
-        envoyer_discord(resultats)
-    else:
-        print("Aucun article n'a pu être récupéré sur les magasins.")
+        if items:
+            envoyer_discord_magasin(magasin["nom"], items)
+        else:
+            print(fort := f"Attention : Impossible de récupérer les articles pour {magasin['nom']}.")
