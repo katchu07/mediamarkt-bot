@@ -5,17 +5,7 @@ import re
 import html
 from datetime import datetime
 
-# URLs des deux magasins Cash Converters (avec encodage propre)
-URLS_MAGASINS = [
-    {
-        "nom": "Magasin Evere",
-        "url": "https://www.cashconverters.be/nl/2-home?q=Winkel-EVERE&order=product.date_add.desc"
-    },
-    {
-        "nom": "Magasin Saint-Josse",
-        "url": "https://www.cashconverters.be/nl/2-home?q=Winkel-SAINT-JOSSE&order=product.date_add.desc"
-    }
-]
+URL_EVERE = "https://www.cashconverters.be/nl/2-home?q=Winkel-EVERE&order=product.date_add.desc"
 
 HEADERS_JSON = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -64,20 +54,19 @@ def extraire_depuis_html(contenu_html):
                 
     return articles
 
-def recuperer_derniers_articles(url_magasin):
+def recuperer_20_derniers_articles():
     articles = []
     
-    # 1. Tentative via l'API JSON PrestaShop
     try:
-        req = urllib.request.Request(url_magasin, headers=HEADERS_JSON)
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        req = urllib.request.Request(URL_EVERE, headers=HEADERS_JSON)
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode('utf-8', errors='ignore'))
             
         if "products" in data and isinstance(data["products"], list):
             for p in data["products"][:20]:
                 nom = nettoyer_texte(p.get("name", "Article sans nom"))
                 prix = nettoyer_texte(p.get("price", p.get("regular_price", "Prix inconnu")))
-                lien = p.get("url", p.get("canonical_url", url_magasin))
+                lien = p.get("url", p.get("canonical_url", URL_EVERE))
                 articles.append({
                     "nom": nom,
                     "prix": prix,
@@ -91,52 +80,46 @@ def recuperer_derniers_articles(url_magasin):
             if articles:
                 return articles
     except Exception as e:
-        print(f"Passage au mode HTML standard pour {url_magasin}")
+        print(f"Passage au mode HTML standard ({e})")
 
-    # 2. Tentative via le HTML complet si le JSON échoue
     try:
-        req = urllib.request.Request(url_magasin, headers=HEADERS_HTML)
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        req = urllib.request.Request(URL_EVERE, headers=HEADERS_HTML)
+        with urllib.request.urlopen(req, timeout=15) as resp:
             page_html = resp.read().decode('utf-8', errors='ignore')
         articles = extraire_depuis_html(page_html)
     except Exception as e:
-        print(f"Erreur de récupération HTML pour {url_magasin} : {e}")
+        print(f"Erreur lors de la récupération HTML : {e}")
 
     return articles[:20]
 
-def envoyer_discord_magasin(nom_magasin, articles):
+def envoyer_discord(articles):
     webhook_url = os.environ.get("DISCORD_WEBHOOK_CASH_EVERE")
     if not webhook_url:
         raise ValueError("Le secret DISCORD_WEBHOOK_CASH_EVERE est introuvable ou vide.")
         
-    if not articles:
-        print(f"Aucun article à envoyer pour {nom_magasin}.")
-        return
-
     date_str = datetime.now().strftime("%d/%m/%Y")
     
-    # Séparer en deux blocs de 10 pour que chaque message reste parfaitement dans les limites Discord
     partie_1 = articles[:10]
     partie_2 = articles[10:]
     
     lignes_1 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_1, 1)]
-    embeds = [{
-        "title": f"📍 {nom_magasin} — Articles 1 à 10",
-        "description": "\n".join(lignes_1),
-        "color": 15844367
-    }]
+    lignes_2 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_2, 11)]
     
-    if partie_2:
-        lignes_2 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_2, 11)]
-        embeds.append({
-            "title": f"📍 {nom_magasin} — Articles 11 à 20",
-            "description": "\n".join(lignes_2),
-            "color": 15844367
-        })
-
     payload = {
-        "content": f"🛒 **Cash Converters — Nouveautés du {date_str} ({nom_magasin})**",
-        "embeds": embeds
+        "content": f"🛒 **Cash Converters Evere — Nouveautés du {date_str}**",
+        "embeds": [
+            {
+                "title": "📦 Articles 1 à 10",
+                "description": "\n".join(lignes_1),
+                "color": 15844367
+            },
+            {
+                "title": "📦 Articles 11 à 20",
+                "description": "\n".join(lignes_2),
+                "color": 15844367,
+                "url": "https://www.cashconverters.be/nl/2-home?q=Winkel-EVERE"
+            }
+        ]
     }
     
     data = json.dumps(payload).encode('utf-8')
@@ -150,13 +133,11 @@ def envoyer_discord_magasin(nom_magasin, articles):
     )
     
     with urllib.request.urlopen(req) as response:
-        print(f"Bilan envoyé avec succès pour {nom_magasin} ! Code HTTP : {response.status}")
+        print(f"Liste Evere envoyée avec succès ! Code HTTP : {response.status}")
 
 if __name__ == "__main__":
-    for magasin in URLS_MAGASINS:
-        print(f"Récupération pour {magasin['nom']}...")
-        items = recuperer_derniers_articles(magasin["url"])
-        if items:
-            envoyer_discord_magasin(magasin["nom"], items)
-        else:
-            print(fort := f"Attention : Impossible de récupérer les articles pour {magasin['nom']}.")
+    liste_20 = recuperer_20_derniers_articles()
+    if liste_20:
+        envoyer_discord(liste_20)
+    else:
+        print("Aucun article n'a pu être récupéré sur Cash Converters Evere.")
