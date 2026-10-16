@@ -1,0 +1,24 @@
+name: Bot Cash Converters Evere
+
+on:
+  schedule:
+    # S'exécute tous les jours à 10h00 UTC (12h00 heure de Bruxelles en été / 11h00 en hiver)
+    - cron: '0 10 * * *'
+  workflow_dispatch: # Permet de lancer un test manuel immédiat
+
+jobs:
+  verifier_evere:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le code du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Lancer le script Cash Converters Evere
+        env:
+          DISCORD_WEBHOOK_CASH_EVERE: ${{ secrets.DISCORD_WEBHOOK_CASH_EVERE }}
+        run: python bot_cash_evere.py
