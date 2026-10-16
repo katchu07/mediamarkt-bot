@@ -6,3 +6,4 @@ DEAL_2026-10-15_https://outlet.mediamarkt.be/index.php?route=product/product&pat
 https://outlet.mediamarkt.be/index.php?route=product/product&path=7095&product_id=338383&sort=p.date_added&order=ASC&limit=50
 DEAL_2026-10-15_https://outlet.mediamarkt.be/index.php?route=product/product&path=7095&product_id=338383&sort=p.date_added&order=ASC&limit=50
 DAILY_REPORT_2026-10-15_22
+MAX_2026-10-16_30_SIEMENS SN63EX22AE - inbouwvaatwasser - Volledig geïntegreerd - 13 bestekken - 42 dB(A)
