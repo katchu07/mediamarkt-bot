@@ -1,12 +1,13 @@
 import os
 import urllib.request
+import urllib.parse
 import xml.etree.ElementTree as ET
 import json
 import re
 import html
 from datetime import datetime
 
-# Configuration des sources couvrant toute la journée
+# Configuration des sources avec contournement anti-bot pour Le Soir et RTL Info
 SOURCES = [
     {
         "nom": "La Libre",
@@ -15,15 +16,13 @@ SOURCES = [
     },
     {
         "nom": "Le Soir",
-        "url": "https://www.lesoir.be/arc/outboundfeeds/rss/?outputType=xml",
-        "url_secours": "https://news.google.com/rss/search?q=site:lesoir.be+when:1d&hl=fr&gl=BE&ceid=BE:fr",
-        "type": "hybride"
+        "url": "https://www.bing.com/news/search?q=site:lesoir.be&format=rss&mkt=fr-BE",
+        "type": "bing_rss"
     },
     {
         "nom": "RTL Info",
-        "url": "https://www.rtl.be/rss.xml",
-        "url_secours": "https://news.google.com/rss/search?q=site:rtl.be+when:1d&hl=fr&gl=BE&ceid=BE:fr",
-        "type": "hybride"
+        "url": "https://www.bing.com/news/search?q=site:rtl.be&format=rss&mkt=fr-BE",
+        "type": "bing_rss"
     },
     {
         "nom": "Google News (Belgique & Monde)",
@@ -37,7 +36,25 @@ HEADERS = {
     'Accept-Language': 'fr-BE,fr;q=0.9'
 }
 
-def nettoyer_texte(texte, max_len=350):
+PHRASES_BLOQUEES = [
+    "informations complètes et à jour",
+    "compilées par google actualités",
+    "google news",
+    "activez javascript"
+]
+
+def est_resume_valide(resume, titre):
+    if not resume or len(resume) < 40:
+        return False
+    resume_low = resume.lower()
+    for b in PHRASES_BLOQUEES:
+        if b in resume_low:
+            return False
+    if resume_low.startswith(titre[:25].lower()):
+        return False
+    return True
+
+def nettoyer_texte(texte, max_len=360):
     if not texte:
         return ""
     texte = html.unescape(texte)
@@ -47,31 +64,19 @@ def nettoyer_texte(texte, max_len=350):
         texte = texte[:max_len - 3].rsplit(' ', 1)[0] + "..."
     return texte
 
-def extraire_meta_description(url):
-    """Récupère le chapeau/résumé directement sur la page de l'article si le flux RSS est vide."""
+def extraire_vrai_lien_bing(lien):
+    """Extrait l'URL directe de l'article (lesoir.be ou rtl.be) depuis un lien de redirection Bing."""
     try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            page_html = resp.read().decode('utf-8', errors='ignore')
-        
-        patterns = [
-            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
-            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']'
-        ]
-        for pat in patterns:
-            m = re.search(pat, page_html, re.IGNORECASE)
-            if m:
-                desc = nettoyer_texte(m.group(1))
-                if len(desc) > 40:
-                    return desc
+        parsed = urllib.parse.urlparse(lien)
+        params = urllib.parse.parse_qs(parsed.query)
+        if 'url' in params and params['url']:
+            return params['url'][0]
     except Exception:
         pass
-    return ""
+    return lien
 
 def extraire_synthese_google_news(description_html, titre_principal):
-    """Transforme la liste des couvertures Google News en une vraie synthèse informative."""
+    """Extrait les différents points de couverture d'un événement majeur sur Google News."""
     if not description_html:
         return ""
     textes_li = re.findall(r'<li[^>]*>(.*?)</li>', description_html, re.DOTALL | re.IGNORECASE)
@@ -85,61 +90,57 @@ def extraire_synthese_google_news(description_html, titre_principal):
             
     if points:
         return "Synthèse des différents médias sur ce sujet :\n" + "\n".join(points[:3])
-    
-    # Si un seul article dans le bloc Google News, on nettoie l'ensemble
-    texte_global = nettoyer_texte(description_html)
-    if texte_global and not texte_global.lower().startswith(titre_base):
-        return texte_global
     return ""
 
-def lire_flux_xml(url):
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=12) as response:
-        return ET.fromstring(response.read())
+def chercher_resume_via_bing(titre):
+    """Si un article Google News n'a qu'un seul lien sans synthèse, récupère son extrait via Bing."""
+    try:
+        titre_propre = titre.split(' - ')[0]
+        q = urllib.parse.quote(titre_propre)
+        url = f"https://www.bing.com/news/search?q={q}&format=rss&mkt=fr-BE"
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            root = ET.fromstring(resp.read())
+        for item in root.findall('.//item')[:2]:
+            desc = item.find('description')
+            if desc is not None and desc.text:
+                texte = nettoyer_texte(desc.text)
+                if est_resume_valide(texte, titre_propre):
+                    return texte
+    except Exception:
+        pass
+    return ""
 
 def extraire_articles(source):
     articles = []
-    root = None
-    utilise_secours = False
-    
     try:
-        root = lire_flux_xml(source["url"])
-    except Exception:
-        if "url_secours" in source:
-            try:
-                root = lire_flux_xml(source["url_secours"])
-                utilise_secours = True
-            except Exception as e:
-                print(f"Erreur sur {source['nom']} : {e}")
-                return []
-        else:
-            return []
+        req = urllib.request.Request(source["url"], headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=12) as response:
+            root = ET.fromstring(response.read())
+    except Exception as e:
+        print(f"Erreur sur {source['nom']} : {e}")
+        return []
 
     items = root.findall('.//item')
-    for item in items[:4]:
+    for item in items[:6]:
         titre_brut = item.find('title').text if item.find('title') is not None else "Sans titre"
         lien = item.find('link').text if item.find('link') is not None else ""
         desc_brute = item.find('description').text if item.find('description') is not None else ""
         
         titre_propre = nettoyer_texte(titre_brut, max_len=150)
-        # Nettoyer le suffixe " - RTL Info" ou " - Le Soir" dans le titre si redondant
         titre_propre = re.sub(r'\s+-\s+(RTL info|RTL\.be|Le Soir|La Libre)$', '', titre_propre, flags=re.IGNORECASE)
         
-        resume = ""
-        if source["type"] == "google_news" or utilise_secours:
+        if source["type"] == "bing_rss":
+            lien = extraire_vrai_lien_bing(lien)
+            resume = nettoyer_texte(desc_brute)
+        elif source["type"] == "google_news":
             resume = extraire_synthese_google_news(desc_brute, titre_propre)
+            if not est_resume_valide(resume, titre_propre):
+                resume = chercher_resume_via_bing(titre_propre)
         else:
             resume = nettoyer_texte(desc_brute)
             
-        # Vérifier si le résumé est vide ou répète simplement le titre
-        if not resume or len(resume) < 35 or resume.lower().startswith(titre_propre[:25].lower()):
-            resume_page = extraire_meta_description(lien)
-            if resume_page and not resume_page.lower().startswith(titre_propre[:25].lower()):
-                resume = resume_page
-
-        # Si vraiment aucun texte supplémentaire n'est fourni par le média (ex: lien Google News verrouillé)
-        if not resume or resume.lower().startswith(titre_propre[:25].lower()):
-            # On cherche un autre article de la même source qui possède un résumé complet
+        if not est_resume_valide(resume, titre_propre):
             continue
 
         articles.append({
