@@ -1,0 +1,25 @@
+name: Bot Actus du Soir
+
+on:
+  schedule:
+    # S'exécute tous les jours à 18h00 UTC (20h00 heure de Bruxelles en été / 19h00 en hiver)
+    - cron: '0 18 * * *'
+  workflow_dispatch: # Permet de lancer le bot manuellement pour tester
+
+jobs:
+  envoyer_actus:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le code du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Lancer le script des actualités
+        env:
+          DISCORD_WEBHOOK_ACTUS: ${{ secrets.DISCORD_WEBHOOK_ACTUS }}
+        run: python bot_actus_soir.py
+        
