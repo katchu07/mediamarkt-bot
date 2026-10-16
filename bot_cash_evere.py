@@ -67,9 +67,10 @@ def extraire_depuis_html(contenu_html):
 def recuperer_derniers_articles(url_magasin):
     articles = []
     
+    # 1. Tentative via l'API JSON PrestaShop (délai étendu à 20 secondes)
     try:
         req = urllib.request.Request(url_magasin, headers=HEADERS_JSON)
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read().decode('utf-8', errors='ignore'))
             
         if "products" in data and isinstance(data["products"], list):
@@ -90,15 +91,16 @@ def recuperer_derniers_articles(url_magasin):
             if articles:
                 return articles
     except Exception as e:
-        print(f"Passage au mode HTML standard pour {url_magasin} ({e})")
+        print(f"Passage au mode HTML standard pour {url_magasin}")
 
+    # 2. Tentative via le HTML complet si le JSON échoue
     try:
         req = urllib.request.Request(url_magasin, headers=HEADERS_HTML)
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             page_html = resp.read().decode('utf-8', errors='ignore')
         articles = extraire_depuis_html(page_html)
     except Exception as e:
-        print(f"Erreur lors de la récupération HTML : {e}")
+        print(f"Erreur définitive de récupération pour ce magasin : {e}")
 
     return articles[:20]
 
@@ -117,27 +119,27 @@ def envoyer_discord(donnees_magasins):
         if not articles:
             continue
             
-        # On divise les 20 articles en deux blocs de 10 pour que ça rentre parfaitement dans les limites Discord
         partie_1 = articles[:10]
         partie_2 = articles[10:]
         
         lignes_1 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_1, 1)]
-        lignes_2 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_2, 11)]
-        
         embeds.append({
             "title": f"📍 {nom_mag} — Articles 1 à 10",
             "description": "\n".join(lignes_1),
             "color": 15844367
         })
-        embeds.append({
-            "title": f"📍 {nom_mag} — Articles 11 à 20",
-            "description": "\n".join(lignes_2),
-            "color": 15844367
-        })
+        
+        if partie_2:
+            lignes_2 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_2, 11)]
+            embeds.append({
+                "title": f"📍 {nom_mag} — Articles 11 à 20",
+                "description": "\n".join(lignes_2),
+                "color": 15844367
+            })
         
     payload = {
         "content": f"🛒 **Cash Converters — Nouveautés du {date_str} (Evere & Saint-Josse)**",
-        "embeds": embeds[:10] # Discord accepte max 10 embeds par message, on prend les 4 blocs (2 par magasin)
+        "embeds": embeds[:10]
     }
     
     data = json.dumps(payload).encode('utf-8')
@@ -151,7 +153,7 @@ def envoyer_discord(donnees_magasins):
     )
     
     with urllib.request.urlopen(req) as response:
-        print(f"Bilan des magasins envoyé avec succès ! Code HTTP : {response.status}")
+        print(f"Bilan envoyé avec succès ! Code HTTP : {response.status}")
 
 if __name__ == "__main__":
     resultats = []
