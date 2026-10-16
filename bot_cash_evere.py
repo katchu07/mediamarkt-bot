@@ -5,7 +5,17 @@ import re
 import html
 from datetime import datetime
 
-URL_EVERE = "https://www.cashconverters.be/nl/2-home?q=Winkel-EVERE&order=product.date_add.desc"
+# URLs des deux magasins Cash Converters
+URLS_MAGASINS = [
+    {
+        "nom": "Magasin Evere",
+        "url": "https://www.cashconverters.be/nl/2-home?q=Winkel-EVERE&order=product.date_add.desc"
+    },
+    {
+        "nom": "Magasin Saint-Josse",
+        "url": "https://www.cashconverters.be/nl/2-home?q=Winkel-SAINT-JOSSE&order=product.date_add.desc"
+    }
+]
 
 HEADERS_JSON = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -24,7 +34,6 @@ def nettoyer_texte(texte):
     texte = html.unescape(texte)
     texte = re.sub(r'<[^>]+>', '', texte)
     texte = " ".join(texte.split())
-    # Met joliment la première lettre en majuscule et le reste en minuscule s'ils sont tout en minuscules
     if texte and texte == texte.lower():
         texte = texte.capitalize()
     return texte
@@ -55,11 +64,11 @@ def extraire_depuis_html(contenu_html):
                 
     return articles
 
-def recuperer_20_derniers_articles():
+def recuperer_derniers_articles(url_magasin):
     articles = []
     
     try:
-        req = urllib.request.Request(URL_EVERE, headers=HEADERS_JSON)
+        req = urllib.request.Request(url_magasin, headers=HEADERS_JSON)
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode('utf-8', errors='ignore'))
             
@@ -67,7 +76,7 @@ def recuperer_20_derniers_articles():
             for p in data["products"][:20]:
                 nom = nettoyer_texte(p.get("name", "Article sans nom"))
                 prix = nettoyer_texte(p.get("price", p.get("regular_price", "Prix inconnu")))
-                lien = p.get("url", p.get("canonical_url", URL_EVERE))
+                lien = p.get("url", p.get("canonical_url", url_magasin))
                 articles.append({
                     "nom": nom,
                     "prix": prix,
@@ -81,10 +90,10 @@ def recuperer_20_derniers_articles():
             if articles:
                 return articles
     except Exception as e:
-        print(f"Passage au mode HTML standard ({e})")
+        print(f"Passage au mode HTML standard pour {url_magasin} ({e})")
 
     try:
-        req = urllib.request.Request(URL_EVERE, headers=HEADERS_HTML)
+        req = urllib.request.Request(url_magasin, headers=HEADERS_HTML)
         with urllib.request.urlopen(req, timeout=15) as resp:
             page_html = resp.read().decode('utf-8', errors='ignore')
         articles = extraire_depuis_html(page_html)
@@ -93,35 +102,42 @@ def recuperer_20_derniers_articles():
 
     return articles[:20]
 
-def envoyer_discord(articles):
+def envoyer_discord(donnees_magasins):
     webhook_url = os.environ.get("DISCORD_WEBHOOK_CASH_EVERE")
     if not webhook_url:
         raise ValueError("Le secret DISCORD_WEBHOOK_CASH_EVERE est introuvable ou vide.")
         
     date_str = datetime.now().strftime("%d/%m/%Y")
+    embeds = []
     
-    # On sépare en deux listes de 10 pour faire deux champs distincts bien propres dans l'embed
-    partie_1 = articles[:10]
-    partie_2 = articles[10:]
-    
-    lignes_1 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_1, 1)]
-    lignes_2 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_2, 11)]
-    
+    for mag in donnees_magasins:
+        nom_mag = mag["nom"]
+        articles = mag["articles"]
+        
+        if not articles:
+            continue
+            
+        # On divise les 20 articles en deux blocs de 10 pour que ça rentre parfaitement dans les limites Discord
+        partie_1 = articles[:10]
+        partie_2 = articles[10:]
+        
+        lignes_1 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_1, 1)]
+        lignes_2 = [f"`{idx:2d}.` [{art['nom']}]({art['lien']}) — **{art['prix']}**" for idx, art in enumerate(partie_2, 11)]
+        
+        embeds.append({
+            "title": f"📍 {nom_mag} — Articles 1 à 10",
+            "description": "\n".join(lignes_1),
+            "color": 15844367
+        })
+        embeds.append({
+            "title": f"📍 {nom_mag} — Articles 11 à 20",
+            "description": "\n".join(lignes_2),
+            "color": 15844367
+        })
+        
     payload = {
-        "content": f"🛒 **Cash Converters Evere — Nouveautés du {date_str}**",
-        "embeds": [
-            {
-                "title": "📦 Articles 1 à 10",
-                "description": "\n".join(lignes_1),
-                "color": 15844367
-            },
-            {
-                "title": "📦 Articles 11 à 20",
-                "description": "\n".join(lignes_2),
-                "color": 15844367,
-                "url": "https://www.cashconverters.be/nl/2-home?q=Winkel-EVERE"
-            }
-        ]
+        "content": f"🛒 **Cash Converters — Nouveautés du {date_str} (Evere & Saint-Josse)**",
+        "embeds": embeds[:10] # Discord accepte max 10 embeds par message, on prend les 4 blocs (2 par magasin)
     }
     
     data = json.dumps(payload).encode('utf-8')
@@ -135,11 +151,19 @@ def envoyer_discord(articles):
     )
     
     with urllib.request.urlopen(req) as response:
-        print(f"Liste propre envoyée avec succès ! Code HTTP : {response.status}")
+        print(f"Bilan des magasins envoyé avec succès ! Code HTTP : {response.status}")
 
 if __name__ == "__main__":
-    liste_20 = recuperer_20_derniers_articles()
-    if liste_20:
-        envoyer_discord(liste_20)
+    resultats = []
+    for magasin in URLS_MAGASINS:
+        print(f"Récupération pour {magasin['nom']}...")
+        items = recuperer_derniers_articles(magasin["url"])
+        resultats.append({
+            "nom": magasin["nom"],
+            "articles": items
+        })
+        
+    if any(m["articles"] for m in resultats):
+        envoyer_discord(resultats)
     else:
-        print("Aucun article n'a pu être récupéré sur Cash Converters Evere.")
+        print("Aucun article n'a pu être récupéré sur les magasins.")
