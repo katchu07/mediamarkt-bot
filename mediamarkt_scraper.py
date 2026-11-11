@@ -4,6 +4,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
+from urllib.parse import urljoin
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
@@ -21,36 +22,9 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
 MEMORY_FILE = "gevonden_deals.txt"
 TZ = ZoneInfo("Europe/Brussels")
 
-# Badge rouge : "-15%" ou "-50 %"
 BADGE_REGEX = re.compile(r"^-\s*(\d{1,2})\s*%$")
 BADGE_IN_TEXT = re.compile(r"(?<![\w.])-\s*(\d{1,2})\s*%")
 PRODUCT_CODE = re.compile(r"\(?\bCP\.[A-Z]+\.\d+\.\d+\)?")
-SKIP_LINES = {"als nieuw", "licht beschadigd", "zichtbaar beschadigd krassen", "meer info"}
-
-# Trouve chaque produit via ses liens "product_id=..." (ne dépend d'aucune classe CSS)
-EXTRACT_JS = """
-() => {
-  const sel = "a[href*='product_id=']";
-  const idOf = a => { const m = a.href.match(/product_id=(\\d+)/); return m ? m[1] : null; };
-  const idsIn = el => new Set(Array.from(el.querySelectorAll(sel)).map(idOf).filter(Boolean));
-  const seen = new Set();
-  const out = [];
-  for (const a of Array.from(document.querySelectorAll(sel))) {
-    const id = idOf(a);
-    if (!id || seen.has(id)) continue;
-    let el = a;
-    for (let i = 0; i < 8; i++) {
-      const p = el.parentElement;
-      if (!p || p === document.body) break;
-      if (idsIn(p).size > 1) break;
-      el = p;
-    }
-    seen.add(id);
-    out.push({ id: id, text: el.innerText || "" });
-  }
-  return out;
-}
-"""
 
 
 def load_seen_deals() -> set:
@@ -66,12 +40,11 @@ def save_seen_deal(key: str):
 
 
 def load_today_max(seen: set, today_str: str):
-    """Plus forte réduction déjà vue aujourd'hui (sur toutes les exécutions)."""
     best_pct, best_title = 0.0, "Unknown"
     prefix = f"MAX_{today_str}_"
     for item in seen:
         if item.startswith(prefix):
-            parts = item.split("_", 3)  # MAX, date, pct, titre
+            parts = item.split("_", 3)
             try:
                 pct = float(parts[2])
             except (IndexError, ValueError):
@@ -83,7 +56,7 @@ def load_today_max(seen: set, today_str: str):
 
 
 def parse_eu_number(val_str: str) -> float:
-    clean = val_str.strip().strip(",.-–")
+    clean = val_str.strip().strip(",.-")
     if not clean:
         return 0.0
     if "," in clean and "." in clean:
@@ -100,9 +73,8 @@ def parse_eu_number(val_str: str) -> float:
 
 
 def extract_prices_for_display(text: str):
-    """Prix uniquement pour l'AFFICHAGE dans Discord (jamais pour calculer la promo)."""
     clean = PRODUCT_CODE.sub(" ", text)
-    found = re.findall(r"€\s*(\d+(?:[.,]\d{3})*(?:[.,]\d{2})?)", clean)
+    found = re.findall(r"€\s*(\d+(?:[.,]\d{3})*(?:[.,]\d{2}|[.,]-)?)", clean)
     prices = [parse_eu_number(p) for p in found]
     prices = [p for p in prices if 1.0 <= p <= 15000.0]
     if not prices:
@@ -110,37 +82,6 @@ def extract_prices_for_display(text: str):
     if len(prices) == 1:
         return 0.0, prices[0]
     return max(prices), min(prices)
-
-
-def read_badge_from_text(text: str):
-    """Lit UNIQUEMENT le pourcentage affiché (ex: '-25%'). Retourne None si pas fiable."""
-    clean = PRODUCT_CODE.sub(" ", text)
-    lines = [l.strip() for l in clean.splitlines() if l.strip()]
-
-    badges = []
-    for l in lines:
-        m = BADGE_REGEX.match(l)
-        if m:
-            badges.append(float(m.group(1)))
-
-    # Secours : "-25%" noyé dans une ligne
-    if not badges:
-        badges = [float(x) for x in BADGE_IN_TEXT.findall(clean)]
-
-    if not badges or len(set(badges)) > 1:
-        return None
-    return badges[0]
-
-
-def extract_title(text: str) -> str:
-    for line in text.splitlines():
-        l = line.strip()
-        if len(l) < 4 or l.lower() in SKIP_LINES:
-            continue
-        if l.startswith("€") or l.startswith("-"):
-            continue
-        return re.sub(r"\s+", " ", l)[:100]
-    return "MediaMarkt Product"
 
 
 def send_discord_deal(title, old_price, new_price, discount, url, now_str) -> bool:
@@ -213,40 +154,72 @@ def send_daily_report(total_found_today, max_seen_discount, max_seen_title, date
 
 
 async def scan_page_products(page, target_url, seen_deals, alerts_sent, highest_tracker, now_str, today_str) -> int:
-    label = target_url.split("path=")[-1].split("&")[0]
     try:
-        await page.goto(target_url, wait_until="domcontentloaded", timeout=90000)
-        await page.wait_for_timeout(3000)
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+        await page.wait_for_timeout(2500)
+        await page.evaluate("window.scrollBy(0, 800)")
+        await page.wait_for_timeout(1000)
     except Exception as e:
         print(f"   [!] Timeout/Skipped {target_url}: {e}")
         return alerts_sent
 
-    products = await page.evaluate(EXTRACT_JS)
-    print(f"   -> {len(products)} products found in category {label}")
-
-    # Diagnostic : si rien n'est trouvé, on affiche ce que le bot voit vraiment
-    if not products:
-        try:
-            title = await page.title()
-            body = (await page.inner_text("body"))[:200].replace("\n", " ")
-            print(f"   [DEBUG] page title: {title!r} | body starts with: {body!r}")
-        except Exception as e:
-            print(f"   [DEBUG] could not read page: {e}")
+    # Extraction ultra-rapide en 1 seul appel JavaScript (ne peut jamais bloquer 10 minutes)
+    try:
+        raw_items = await page.evaluate(
+            """() => {
+                const selectors = 'div.product-layout, div.product-thumb, div.product, article, li.product-item, div[class*="product"]';
+                const nodes = Array.from(document.querySelectorAll(selectors));
+                const results = [];
+                for (const el of nodes) {
+                    const text = (el.innerText || '').trim();
+                    if (text.length < 15 || !text.includes('€')) continue;
+                    const link = el.querySelector('a[href*="product"], a[href]');
+                    if (!link) continue;
+                    const shortTexts = Array.from(el.querySelectorAll('span, div, p, b, strong, small'))
+                        .map(e => (e.innerText || '').trim())
+                        .filter(t => t.length > 0 && t.length < 8);
+                    results.push({
+                        text: text,
+                        href: link.getAttribute('href') || '',
+                        shortTexts: shortTexts
+                    });
+                }
+                return results;
+            }"""
+        )
+    except Exception as e:
+        print(f"   [!] Evaluation error: {e}")
         return alerts_sent
 
-    with_badge = 0
-    for prod in products:
+    print(f"   -> {len(raw_items)} product blocks checked on {target_url.split('&path=')[-1]}")
+
+    for item in raw_items:
         if alerts_sent >= MAX_ALERTS_PER_RUN:
             break
         try:
-            text = prod["text"]
-            discount_pct = read_badge_from_text(text)
-            if discount_pct is None:
-                continue
-            with_badge += 1
+            text = item["text"]
+            href = item["href"]
+            product_url = urljoin(BASE_URL, href) if href else BASE_URL
 
-            title = extract_title(text)
-            product_url = f"{BASE_URL}index.php?route=product/product&product_id={prod['id']}"
+            lines = [l for l in re.split(r"\n", text.strip()) if l.strip()]
+            title = lines[0] if lines else "MediaMarkt Product"
+            if "Als nieuw" in title or "Korting" in title or "€" in title or title.strip().startswith("-"):
+                title = lines[1] if len(lines) > 1 else title
+            title = re.sub(r"\s+", " ", title)[:100]
+
+            badges = []
+            for t in item["shortTexts"]:
+                m = BADGE_REGEX.match(t)
+                if m:
+                    badges.append(float(m.group(1)))
+            if not badges:
+                clean_text = PRODUCT_CODE.sub(" ", text)
+                badges = [float(x) for x in BADGE_IN_TEXT.findall(clean_text)]
+
+            if not badges or len(set(badges)) > 1:
+                continue
+
+            discount_pct = badges[0]
 
             if discount_pct > highest_tracker["pct"]:
                 highest_tracker["pct"] = discount_pct
@@ -259,7 +232,6 @@ async def scan_page_products(page, target_url, seen_deals, alerts_sent, highest_
                 old_price, new_price = extract_prices_for_display(text)
                 print(f"   🔥 MATCH FOUND: {title} | -{discount_pct:.0f}%")
 
-                # On ne mémorise le deal que si l'alerte est vraiment partie sur Discord
                 if send_discord_deal(title, old_price, new_price, discount_pct, product_url, now_str):
                     save_seen_deal(product_url)
                     seen_deals.add(product_url)
@@ -269,11 +241,9 @@ async def scan_page_products(page, target_url, seen_deals, alerts_sent, highest_
                     seen_deals.add(daily_deal_key)
 
                     alerts_sent += 1
-        except Exception as e:
-            print(f"   [!] Error on a product: {e}")
+        except Exception:
             continue
 
-    print(f"   -> {with_badge} of them have a discount badge")
     return alerts_sent
 
 
@@ -286,7 +256,6 @@ async def main():
     seen_deals = load_seen_deals()
     alerts_sent = 0
 
-    # On repart de la plus forte réduction déjà vue aujourd'hui
     stored_pct, stored_title = load_today_max(seen_deals, today_str)
     highest_tracker = {"pct": stored_pct, "title": stored_title}
 
@@ -301,6 +270,14 @@ async def main():
             timezone_id="Europe/Brussels",
         )
         page = await context.new_page()
+        # Plafond strict de 10s par sous-action pour empêcher tout blocage de 10 minutes
+        page.set_default_timeout(10000)
+
+        try:
+            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(2000)
+        except Exception as e:
+            print(f"   [!] Warning accessing base URL: {e}")
 
         fast_categories = [
             f"{BASE_URL}index.php?route=product/category&path=7060&sort=p.date_added&order=ASC&limit=50",
@@ -316,13 +293,11 @@ async def main():
 
         await browser.close()
 
-    # Mémorise la nouvelle plus forte réduction du jour
     if highest_tracker["pct"] > stored_pct:
         save_seen_deal(f"MAX_{today_str}_{int(highest_tracker['pct'])}_{highest_tracker['title']}")
 
     total_found_today = sum(1 for item in seen_deals if item.startswith(f"DEAL_{today_str}_"))
 
-    # Rapport envoyé dès 22:00 passé, une seule fois par jour
     report_flag = f"DAILY_REPORT_{today_str}"
     report_due = (now_be.hour, now_be.minute) >= (REPORT_HOUR, REPORT_MINUTE)
     if report_due and report_flag not in seen_deals:
